@@ -24,8 +24,8 @@ SOURCES = [
     "src/gguf.c",
     "src/tokenizer.c",
     "src/quant.c",
+    "src/model.c",   # MUST precede attn.c — attn.c calls helpers defined here
     "src/attn.c",
-    "src/model.c",
     "src/sampler.c",
     "src/api.c",
 ]
@@ -44,8 +44,9 @@ INTERNAL_HEADERS = [
 ]
 
 # Patterns to strip from individual files when merging.
+# Matches: #include "foo.h"  optionally followed by a trailing C comment.
 _STRIP_INCLUDE_INTERNAL = re.compile(
-    r'^\s*#\s*include\s+"[^"]*"\s*$', re.MULTILINE
+    r'^\s*#\s*include\s+"[^"]*"\s*(?:/\*[^*]*\*/\s*)?$', re.MULTILINE
 )
 _STRIP_INCLUDE_GUARD_START = re.compile(
     r'^\s*#\s*ifndef\s+CMOL_\w+_H\b.*\n\s*#\s*define\s+CMOL_\w+_H\b.*\n',

@@ -3,7 +3,7 @@ models/
 *.o
 *.a
 *.gguf
-cmol_amalgam.h
+# cmol_amalgam.h is committed (regenerate with: make amalgamate)
 compile_commands.json
 .DS_Store
 .cache/
