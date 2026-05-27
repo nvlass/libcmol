@@ -28,6 +28,17 @@ void cmol_mmap_close(cmol_mmap_t *m) {
 
 #else
 /* ---- POSIX --------------------------------------------------------------- */
+
+/* MADV_SEQUENTIAL is a Linux/BSD extension not visible under strict C99.
+ * _DEFAULT_SOURCE (glibc >= 2.19) or _BSD_SOURCE re-exposes it without
+ * pulling in the full GNU namespace.  Define before any system header. */
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE
+#endif
+#ifndef _BSD_SOURCE          /* older glibc (< 2.19, e.g. Raspbian Wheezy) */
+#  define _BSD_SOURCE
+#endif
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -46,8 +57,12 @@ cmol_err_t cmol_mmap_open(const char *path, cmol_mmap_t *out) {
     close(fd); /* fd can be closed immediately; mapping keeps the data alive */
     if (data == MAP_FAILED) return CMOL_ERR_IO;
 
-    /* Hint to the OS: we'll read sequentially during the parse pass */
+    /* Hint to the OS: we'll read sequentially during the parse pass.
+     * Guarded: MADV_SEQUENTIAL may be absent on non-Linux POSIX targets
+     * even with _DEFAULT_SOURCE (e.g. older musl, OpenBSD). */
+#ifdef MADV_SEQUENTIAL
     madvise(data, (size_t)st.st_size, MADV_SEQUENTIAL);
+#endif
 
     out->data = data;
     out->size = (size_t)st.st_size;
