@@ -219,6 +219,8 @@ struct cmol_session {
     cmol_kvcache_t  kvcache;
     float          *scratch;       /* activation scratch for one chunk    */
     size_t          scratch_size;  /* bytes allocated                     */
+    int32_t        *token_buf;     /* temp token array for cmol_generate  */
+    int             token_buf_cap; /* capacity in tokens (= cfg.max_ctx)  */
     int             slot;          /* index in model->session_slots       */
 };
 

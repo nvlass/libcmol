@@ -46,12 +46,12 @@ platform.c → arena.c → gguf.c → tokenizer.c → quant.c
 | 4  | ✅ Done    | `quant.c` (Q8\_0, Q4\_K, Q6\_K dequant + matmul, AVX2/AVX-512/NEON/scalar) |
 | 5  | ✅ Done    | `model.c` + `attn.c` (RMSNorm, RoPE, GQA, SwiGLU, KV cache, NoPE, QK-norm) |
 | 6  | ✅ Done    | `sampler.c` (xoshiro256\*\*, greedy, temperature, top-k, top-p) |
-| 7  | ⬜ Next    | `api.c`: `cmol_load()`, `cmol_free()`, `cmol_generate()` |
-| 8  | ⬜ Pending | `tests/test_generate.c`, `tests/test_threads.c` |
+| 7  | ✅ Done    | `api.c`: `cmol_load()`, `cmol_free()`, `cmol_generate()` |
+| 8  | 🔶 Partial | `tests/test_generate.c` (22 unit tests + live tests); `tests/test_threads.c` pending |
 | 9  | ⬜ Pending | `examples/` (`repl.c`, `oneshot.c`) compilation verification |
 | 10 | ⬜ Pending | `tools/amalgamate.py` → `cmol_amalgam.h` |
 
-**Test counts:** `test_gguf`=47, `test_tokenizer`=39, `test_quant`=38, `test_model`=27, `test_sampler`=36 → **187 total**
+**Test counts:** `test_gguf`=47, `test_tokenizer`=39, `test_quant`=38, `test_model`=27, `test_sampler`=36, `test_generate`=22 (unit) + live → **209+ total**
 
 Run all: `make test`
 
@@ -123,27 +123,30 @@ Q6\_K value reconstruction: `lo | (hi << 4) - 32`, range `[-32, 31]`.
 - `seed=0` → non-deterministic: `time(NULL) ^ ++counter * constant ^ (uintptr_t)state`
 - `!rng_state` → deterministic top-1 fallback (no sampling)
 
-## Phase 7 Implementation Notes
+## Phase 7 — Completed
 
-### `cmol_load()`
+`cmol_load()` layout:
+1. `cmol_gguf_peek()` → hparams + n_tensors count
+2. Clamp/resolve config (max_ctx, max_sessions, prefill_chunk)
+3. Compute `total_buf = sizeof(cmol_model_t) aligned-16 + arena_need`
+4. Single `malloc(total_buf)` → model struct at `buf[0]` → `cmol_arena_init()` at `buf + model_hdr`
+5. `cmol_mmap_open()` the GGUF
+6. `cmol_gguf_parse()` → tensors + tokenizer raw data → arena
+7. `cmol_tokenizer_build()` → runtime lookup tables → arena
+8. `cmol_kernels_select()` → `model->kernels`
+9. Allocate per-session: `session_slots[]`, `kvcache.k/v`, `scratch`, `token_buf` all from arena
+10. `pool_free` bitmask, `pthread_mutex_init()`
 
-1. `cmol_gguf_parse()` to get hparams, tokenizer strings/scores, tensor descriptors
-2. Compute total arena size: KV caches (one per session) + scratch (one per session) + session pool + tokenizer tables
-3. Single `malloc()` → `cmol_arena_init()` → bump-allocate everything
-4. `cmol_tokenizer_build()` on the arena
-5. `cmol_kernels_select()` → store in `model->kn`
-6. Return `cmol_model_t*`
+`cmol_generate()` pipeline:
+1. `cmol_tokenizer_encode()` prompt → `session->token_buf`
+2. Prefill: `cmol_model_forward(token, pos++)` for each prompt token; `kvcache.n_tokens` updated after
+3. Sample: `cmol_sample(logits, ...)` → next token; decode → `on_token` callback
+4. Stop on EOS, `max_new_tokens`, full context, or callback returning non-zero
 
-**Fix needed in `api.c`:** `cmol__arena_size()` scratch formula is a placeholder — replace with:
-```c
-size_t scratch = (5*d + 2*kv_dim + max_ctx + 2*d_ffn + vocab) * sizeof(float);
-```
-
-### `cmol_generate()`
-
-1. `cmol_encode()` prompt → token IDs
-2. Prefill loop: feed tokens in chunks of `prefill_chunk`, calling `cmol_model_forward()` for each
-3. Generation loop: `cmol_model_forward()` → `cmol_sample()` → call `on_token` callback → stop on EOS or `max_new_tokens`
+Arena size per session:
+- KV cache: `2 × n_layers × max_ctx × n_kv_heads × d_head × 4` bytes
+- Scratch: `(5×d + 2×kv + ctx + 2×d_ffn + vocab) × 4` bytes
+- Token buf: `max_ctx × 4` bytes
 
 ## Design Constraints
 

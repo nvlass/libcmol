@@ -1,14 +1,16 @@
 /*
  * api.c — public API implementation
- * Phases 2 and 7 (lifecycle, session management, generate).
  * Included by src/cmol.c (unity build); do not compile standalone.
  */
 
 #include "../include/cmol.h"
 #include "cmol_internal.h"
-#include "gguf.h"        /* cmol_gguf_peek, cmol_gguf_parse             */
-#include "tokenizer.h"   /* cmol_tokenizer_encode, _decode_token        */
-/* Phase 7 will also use: arena.h, quant.h, model.h, sampler.h */
+#include "arena.h"
+#include "gguf.h"
+#include "tokenizer.h"
+#include "quant.h"    /* cmol_kernels_select */
+#include "model.h"    /* cmol_model_forward  */
+#include "sampler.h"  /* cmol_sample, cmol_rng_seed */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -16,7 +18,7 @@
 #include <string.h>
 
 /* =========================================================================
- * Utilities  (available immediately)
+ * Utilities
  * ====================================================================== */
 
 const char *cmol_strerror(cmol_err_t err) {
@@ -51,48 +53,59 @@ void cmol_log(const cmol_model_t *m, int level, const char *fmt, ...) {
 /* =========================================================================
  * Arena size calculation
  *
- * Computes the total arena bytes needed for a given model + config.
- * All sizes are conservative (round up).
+ * Returns the number of bytes needed for the arena (everything AFTER the
+ * model struct itself, which is placed at the start of arena_buf).
  * ====================================================================== */
 
 static size_t cmol__arena_size(const cmol_hparams_t *hp,
-                                const cmol_config_t  *cfg) {
-    int ns  = cfg->max_sessions;
-    int ctx = cfg->max_ctx;
+                                const cmol_config_t  *cfg,
+                                size_t                n_tensors) {
+    int ns    = cfg->max_sessions;
+    int ctx   = cfg->max_ctx;
+    int d     = hp->d_model;
+    int kv    = hp->n_kv_heads * hp->d_head;
+    int d_ffn = hp->d_ffn;
+    int vocab = hp->vocab_size;
+    int nl    = hp->n_layers;
 
-    /* KV cache: 2 buffers (K and V) × layers × ctx × kv_heads × d_head × float */
-    size_t kv_per_session = 2u
-        * (size_t)hp->n_layers
-        * (size_t)ctx
-        * (size_t)hp->n_kv_heads
-        * (size_t)hp->d_head
-        * sizeof(float);
+    /* Tensor descriptors */
+    size_t tensor_descs = n_tensors * sizeof(cmol_tensor_t);
 
-    /* Scratch: activation buffer sized for one prefill chunk.
-     * Needs to hold at least: d_model + d_ffn*2 + n_heads*d_head
-     * (conservative: 4 × d_model as a safe upper bound) */
-    size_t scratch_per_session = 4u * (size_t)hp->d_model * sizeof(float)
-                               + (size_t)hp->vocab_size   * sizeof(float);
+    /* Tokenizer raw data (vocab strings, scores, token_type, merge arrays)
+     * + tokenizer_build tables (decoded_vocab, vocab_sort_idx, merge_result,
+     * msort_idx, decoded strings).
+     * Upper bound: vocab_size * 80 covers all arenas for SmolLM2/3. */
+    size_t tokenizer = (size_t)vocab * 80u;
 
-    /* Tensor descriptor array */
-    size_t tensor_descs = 512u * sizeof(cmol_tensor_t); /* 512 tensors max */
-
-    /* Tokenizer strings, merge rules (rough upper bound) */
-    size_t tokenizer = (size_t)hp->vocab_size * 32u    /* avg token len   */
-                     + (size_t)hp->vocab_size * 8u;    /* merge pairs     */
-
-    /* Session slot structs themselves */
+    /* Session slot structs */
     size_t session_structs = (size_t)ns * sizeof(struct cmol_session);
 
-    /* Alignment padding: 64 bytes per allocation × generous factor */
-    size_t padding = 4096u;
+    /* Per-session KV cache: K array + V array */
+    size_t kv_per_session = 2u
+        * (size_t)nl * (size_t)ctx * (size_t)kv * sizeof(float);
 
-    return  tensor_descs
-          + tokenizer
-          + session_structs
-          + (size_t)ns * kv_per_session
-          + (size_t)ns * scratch_per_session
-          + padding;
+    /* Per-session scratch:
+     *   x[d] + xnorm[d] + q[d] + k_buf[kv] + v_buf[kv] +
+     *   scores[ctx] + attn_out[d] + ffn_gate[d_ffn] + ffn_up[d_ffn] +
+     *   logits[vocab]                                                  */
+    size_t scratch_per_session = (
+        5u*(size_t)d + 2u*(size_t)kv + (size_t)ctx
+        + 2u*(size_t)d_ffn + (size_t)vocab
+    ) * sizeof(float);
+
+    /* Per-session token buffer for encode during generate */
+    size_t tokbuf_per_session = (size_t)ctx * sizeof(int32_t);
+
+    /* Alignment padding: 64 bytes × generous factor */
+    size_t padding = (size_t)(ns + 1) * 64u + 512u;
+
+    return tensor_descs
+         + tokenizer
+         + session_structs
+         + (size_t)ns * kv_per_session
+         + (size_t)ns * scratch_per_session
+         + (size_t)ns * tokbuf_per_session
+         + padding;
 }
 
 /* =========================================================================
@@ -100,43 +113,197 @@ static size_t cmol__arena_size(const cmol_hparams_t *hp,
  * ====================================================================== */
 
 size_t cmol_arena_estimate(const char *gguf_path, const cmol_config_t *cfg) {
-    if (!gguf_path || !cfg) return 0;
+    static const cmol_config_t def = CMOL_DEFAULT_CONFIG;
+    if (!gguf_path) return 0;
+    if (!cfg) cfg = &def;
 
     cmol_hparams_t hp;
     size_t         n_tensors;
     if (cmol_gguf_peek(gguf_path, &hp, &n_tensors) != CMOL_OK) return 0;
 
-    /* Clamp max_ctx to what the model supports */
     cmol_config_t c = *cfg;
-    if (c.max_ctx > hp.model_max_ctx) c.max_ctx = hp.model_max_ctx;
+    if (c.max_ctx <= 0 || c.max_ctx > hp.model_max_ctx) c.max_ctx = hp.model_max_ctx;
+    if (c.max_sessions <= 0) c.max_sessions = 4;
+    if (c.max_sessions > CMOL_MAX_SESSIONS) c.max_sessions = CMOL_MAX_SESSIONS;
 
-    return cmol__arena_size(&hp, &c);
+    /* Add sizeof(model) to the estimate since the caller may use it as a
+     * total-budget check against available RAM. */
+    return sizeof(struct cmol_model)
+         + cmol__arena_size(&hp, &c, n_tensors);
 }
 
 /* =========================================================================
- * cmol_load / cmol_free
- * Phase 7 — TODO: full implementation
+ * cmol_load
  * ====================================================================== */
 
 cmol_model_t *cmol_load(const char          *gguf_path,
                          const cmol_config_t *cfg,
                          cmol_err_t          *err) {
-    (void)gguf_path; (void)cfg;
-    if (err) *err = CMOL_ERR_UNSUPPORTED;
-    return NULL; /* Phase 7 */
+    static const cmol_config_t def = CMOL_DEFAULT_CONFIG;
+    cmol_err_t rc;
+
+    if (!gguf_path) { if (err) *err = CMOL_ERR_ARGS; return NULL; }
+    if (!cfg) cfg = &def;
+
+    /* ── 1. Peek: get hparams + tensor count without full parse ─────────── */
+    cmol_hparams_t hp;
+    size_t         n_tensors_peek;
+    rc = cmol_gguf_peek(gguf_path, &hp, &n_tensors_peek);
+    if (rc != CMOL_OK) { if (err) *err = rc; return NULL; }
+
+    /* ── 2. Resolve / clamp config ───────────────────────────────────────── */
+    cmol_config_t c = *cfg;
+    if (c.max_ctx <= 0 || c.max_ctx > hp.model_max_ctx)
+        c.max_ctx = hp.model_max_ctx;
+    if (c.max_sessions <= 0)             c.max_sessions  = 4;
+    if (c.max_sessions > CMOL_MAX_SESSIONS) c.max_sessions = CMOL_MAX_SESSIONS;
+    if (c.prefill_chunk <= 0)            c.prefill_chunk = 512;
+
+    /* ── 3. Compute allocation sizes ─────────────────────────────────────── */
+    /* The model struct is placed at buf[0]; the arena starts immediately after
+     * (aligned to 16 bytes). */
+    size_t model_hdr  = (sizeof(struct cmol_model) + 15u) & ~15u;
+    size_t arena_need = cmol__arena_size(&hp, &c, n_tensors_peek);
+    size_t total_buf  = model_hdr + arena_need;
+
+    /* ── 4. Single malloc ────────────────────────────────────────────────── */
+    uint8_t *buf = (uint8_t *)malloc(total_buf);
+    if (!buf) { if (err) *err = CMOL_ERR_OOM; return NULL; }
+    memset(buf, 0, total_buf);
+
+    /* ── 5. Model struct at buf[0]; arena starts after it ───────────────── */
+    cmol_model_t *m = (cmol_model_t *)(void *)buf;
+    m->arena_buf = buf;
+    cmol_arena_init(&m->arena, buf + model_hdr, arena_need);
+    m->cfg = c;
+
+    /* ── 6. mmap the GGUF file ───────────────────────────────────────────── */
+    rc = cmol_mmap_open(gguf_path, &m->mmap);
+    if (rc != CMOL_OK) {
+        free(buf);
+        if (err) *err = rc;
+        return NULL;
+    }
+
+    /* ── 7. Full GGUF parse ─────────────────────────────────────────────── */
+    rc = cmol_gguf_parse(&m->mmap, &m->arena,
+                          &m->hparams, &m->tensors, &m->n_tensors,
+                          &m->tokenizer);
+    if (rc != CMOL_OK) {
+        cmol_mmap_close(&m->mmap);
+        free(buf);
+        if (err) *err = rc;
+        return NULL;
+    }
+
+    /* ── 8. Build tokenizer runtime lookup tables ────────────────────────── */
+    rc = cmol_tokenizer_build(&m->tokenizer, &m->arena);
+    if (rc != CMOL_OK) {
+        cmol_mmap_close(&m->mmap);
+        free(buf);
+        if (err) *err = rc;
+        return NULL;
+    }
+
+    /* ── 9. SIMD kernel selection ────────────────────────────────────────── */
+    m->kernels = cmol_kernels_select();
+
+    /* ── 10. Allocate session pool ───────────────────────────────────────── */
+    m->session_slots = (struct cmol_session *)cmol_arena_alloc_n(
+            &m->arena, (size_t)c.max_sessions, sizeof(struct cmol_session));
+    if (!m->session_slots) {
+        cmol_mmap_close(&m->mmap);
+        free(buf);
+        if (err) *err = CMOL_ERR_OOM;
+        return NULL;
+    }
+
+    {
+        const cmol_hparams_t *fhp = &m->hparams;
+        int d     = fhp->d_model;
+        int kv    = fhp->n_kv_heads * fhp->d_head;
+        int ctx   = c.max_ctx;
+        int d_ffn = fhp->d_ffn;
+        int vocab = fhp->vocab_size;
+        int nl    = fhp->n_layers;
+        int i;
+
+        size_t kv_floats = (size_t)nl * (size_t)ctx * (size_t)kv;
+        size_t scratch_floats = 5u*(size_t)d + 2u*(size_t)kv
+                              + (size_t)ctx + 2u*(size_t)d_ffn + (size_t)vocab;
+
+        for (i = 0; i < c.max_sessions; i++) {
+            struct cmol_session *s = &m->session_slots[i];
+            s->model = m;
+            s->slot  = i;
+
+            /* K cache */
+            s->kvcache.k = (float *)cmol_arena_alloc_n(
+                    &m->arena, kv_floats, sizeof(float));
+            /* V cache */
+            s->kvcache.v = (float *)cmol_arena_alloc_n(
+                    &m->arena, kv_floats, sizeof(float));
+            /* Scratch */
+            s->scratch = (float *)cmol_arena_alloc_n(
+                    &m->arena, scratch_floats, sizeof(float));
+            /* Prompt token buffer */
+            s->token_buf = (int32_t *)cmol_arena_alloc_n(
+                    &m->arena, (size_t)ctx, sizeof(int32_t));
+
+            if (!s->kvcache.k || !s->kvcache.v || !s->scratch || !s->token_buf) {
+                cmol_mmap_close(&m->mmap);
+                free(buf);
+                if (err) *err = CMOL_ERR_OOM;
+                return NULL;
+            }
+
+            s->kvcache.n_tokens  = 0;
+            s->kvcache.max_tokens = ctx;
+            s->scratch_size      = scratch_floats * sizeof(float);
+            s->token_buf_cap     = ctx;
+        }
+    }
+
+    /* ── 11. Pool bitmask: all slots free ────────────────────────────────── */
+    m->pool_free = (c.max_sessions == 32)
+                 ? 0xFFFFFFFFu
+                 : (1u << c.max_sessions) - 1u;
+
+    /* ── 12. Mutex ───────────────────────────────────────────────────────── */
+    if (pthread_mutex_init(&m->pool_lock, NULL) != 0) {
+        cmol_mmap_close(&m->mmap);
+        free(buf);
+        if (err) *err = CMOL_ERR_OOM;
+        return NULL;
+    }
+
+    CMOL_LOGI(m,
+        "cmol_load: arch=%s layers=%d heads=%d/%d d=%d ffn=%d "
+        "vocab=%d ctx=%d sessions=%d kernel=%s",
+        m->hparams.arch, m->hparams.n_layers,
+        m->hparams.n_heads, m->hparams.n_kv_heads,
+        m->hparams.d_model, m->hparams.d_ffn,
+        m->hparams.vocab_size, c.max_ctx, c.max_sessions,
+        m->kernels.name);
+
+    if (err) *err = CMOL_OK;
+    return m;
 }
+
+/* =========================================================================
+ * cmol_free
+ * ====================================================================== */
 
 void cmol_free(cmol_model_t *m) {
     if (!m) return;
-    cmol_mmap_close(&m->mmap);
     pthread_mutex_destroy(&m->pool_lock);
+    cmol_mmap_close(&m->mmap);
     free(m->arena_buf);
-    /* m itself lives in arena_buf, so it is freed above */
+    /* m itself lives inside arena_buf, freed above */
 }
 
 /* =========================================================================
  * Session management
- * Phase 7 — TODO: full implementation
  * ====================================================================== */
 
 cmol_session_t *cmol_session_acquire(cmol_model_t *m) {
@@ -144,10 +311,9 @@ cmol_session_t *cmol_session_acquire(cmol_model_t *m) {
     pthread_mutex_lock(&m->pool_lock);
     if (!m->pool_free) {
         pthread_mutex_unlock(&m->pool_lock);
-        return NULL; /* CMOL_ERR_NO_SESSION — caller retries */
+        return NULL;
     }
-    /* Find lowest free slot via bit scan */
-    int slot = __builtin_ctz(m->pool_free); /* GCC/Clang; Phase 7: add MSVC fallback */
+    int slot = __builtin_ctz(m->pool_free);
     m->pool_free &= ~(1u << slot);
     pthread_mutex_unlock(&m->pool_lock);
     return &m->session_slots[slot];
@@ -164,7 +330,7 @@ void cmol_session_release(cmol_session_t *s) {
 void cmol_session_reset(cmol_session_t *s) {
     if (!s) return;
     s->kvcache.n_tokens = 0;
-    /* scratch buffer intentionally not zeroed — will be overwritten */
+    /* scratch intentionally not zeroed — overwritten on next forward pass */
 }
 
 /* =========================================================================
@@ -184,7 +350,14 @@ const char *cmol_decode_token(cmol_model_t *m, int32_t token_id) {
 
 /* =========================================================================
  * cmol_generate
- * Phase 7 — TODO: prefill loop + generation loop
+ *
+ * Pipeline:
+ *   1. Encode prompt → token IDs (written into session->token_buf).
+ *   2. Prefill: call cmol_model_forward for each prompt token,
+ *      building the KV cache.  Logits are discarded except after the
+ *      final prompt token.
+ *   3. Generation loop: sample → decode → callback → repeat.
+ *      Stop on EOS, max_new_tokens, full context, or callback abort.
  * ====================================================================== */
 
 cmol_err_t cmol_generate(cmol_session_t          *s,
@@ -192,6 +365,85 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
                           const cmol_gen_params_t *params,
                           cmol_token_cb_t          on_token,
                           void                    *userdata) {
-    (void)s; (void)prompt; (void)params; (void)on_token; (void)userdata;
-    return CMOL_ERR_UNSUPPORTED; /* Phase 7 */
+    static const cmol_gen_params_t def_params = CMOL_DEFAULT_PARAMS;
+
+    if (!s || !prompt) return CMOL_ERR_ARGS;
+    if (!params) params = &def_params;
+
+    cmol_model_t          *m  = s->model;
+    const cmol_hparams_t  *hp = &m->hparams;
+
+    /* Context capacity check */
+    if (s->kvcache.n_tokens >= s->kvcache.max_tokens)
+        return CMOL_ERR_CTX_FULL;
+
+    /* ── 1. Encode prompt ────────────────────────────────────────────────── */
+    int n_prompt = cmol_tokenizer_encode(
+            &m->tokenizer, prompt,
+            s->token_buf, s->token_buf_cap,
+            /*add_bos=*/1);
+    if (n_prompt < 0)  return (cmol_err_t)n_prompt;
+    if (n_prompt == 0) return CMOL_OK;
+
+    /* Clamp to available context */
+    {
+        int avail = s->kvcache.max_tokens - s->kvcache.n_tokens;
+        if (n_prompt > avail) n_prompt = avail;
+    }
+
+    /* ── 2. Prefill: forward pass for each prompt token ─────────────────── */
+    float  *logits = NULL;
+    int     pos    = s->kvcache.n_tokens;
+    int     i;
+
+    for (i = 0; i < n_prompt; i++) {
+        logits = cmol_model_forward(m, s, s->token_buf[i], pos);
+        pos++;
+    }
+    s->kvcache.n_tokens = pos;
+
+    if (!logits) return CMOL_ERR_INVALID; /* tensor missing */
+
+    /* ── 3. Generation loop ──────────────────────────────────────────────── */
+    int     max_new = params->max_new_tokens;
+    if (max_new < 0) max_new = s->kvcache.max_tokens; /* generate until EOS */
+
+    /* Seed RNG once for this call */
+    uint64_t rng[4];
+    cmol_rng_seed(rng, params->seed);
+
+    int n_generated = 0;
+
+    for (;;) {
+        /* ── Sample next token ─────────────────────────────────────────── */
+        int32_t next_tok = cmol_sample(logits, hp->vocab_size, params, rng);
+
+        /* ── Decode + fire callback ────────────────────────────────────── */
+        int is_eos = (next_tok == hp->eos_token_id);
+
+        if (on_token) {
+            const char *piece = cmol_tokenizer_decode_token(&m->tokenizer,
+                                                             next_tok);
+            size_t len = piece ? strlen(piece) : 0;
+            int stop = on_token(piece ? piece : "", len, is_eos, userdata);
+            if (stop) break; /* caller aborted */
+        }
+
+        if (is_eos) break;
+
+        n_generated++;
+        if (max_new > 0 && n_generated >= max_new) break;
+
+        /* ── Context full? ─────────────────────────────────────────────── */
+        if (pos >= s->kvcache.max_tokens) break;
+
+        /* ── Forward pass for the sampled token ───────────────────────── */
+        logits = cmol_model_forward(m, s, next_tok, pos);
+        pos++;
+        s->kvcache.n_tokens = pos;
+
+        if (!logits) return CMOL_ERR_INVALID;
+    }
+
+    return CMOL_OK;
 }
