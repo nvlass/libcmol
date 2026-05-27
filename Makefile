@@ -90,6 +90,78 @@ srcs = ['src/cmol.c'] + glob.glob('tests/test_*.c') + glob.glob('examples/*.c');
 open('compile_commands.json','w').write(json.dumps(entries, indent=2)); \
 print('  GEN   compile_commands.json (' + str(len(entries)) + ' entries)')"
 
+# ── Model fetch targets ───────────────────────────────────────────────────
+#
+# Downloads SmolLM2 GGUF files from Hugging Face into ./models/.
+# Uses `huggingface-cli` when available (pip install huggingface_hub);
+# falls back to curl/wget.
+#
+# Usage:
+#   make fetch-smol2-135m     # ~90 MB  Q4_K_M — fits RPi Zero W / any phone
+#   make fetch-smol2-360m     # ~230 MB Q4_K_M
+#   make fetch-smol2-1.7b     # ~1.1 GB Q4_K_M
+#   make fetch-smol3-1.7b     # ~1.1 GB Q4_K_M (SmolLM3 — NoPE + QK-norm)
+#
+# To pick a different quant level set QUANT=Q8_0 (or Q5_K_M, etc.):
+#   make fetch-smol2-1.7b QUANT=Q8_0
+
+MODELS_DIR = models
+QUANT      ?= Q4_K_M
+
+# Repo / filename patterns on HF
+HF_SMOL2_135M_REPO = bartowski/SmolLM2-135M-Instruct-GGUF
+HF_SMOL2_360M_REPO = bartowski/SmolLM2-360M-Instruct-GGUF
+HF_SMOL2_1B7_REPO  = bartowski/SmolLM2-1.7B-Instruct-GGUF
+HF_SMOL3_1B7_REPO  = bartowski/SmolLM3-1.7B-Instruct-GGUF
+
+HF_SMOL2_135M_FILE = SmolLM2-135M-Instruct-$(QUANT).gguf
+HF_SMOL2_360M_FILE = SmolLM2-360M-Instruct-$(QUANT).gguf
+HF_SMOL2_1B7_FILE  = SmolLM2-1.7B-Instruct-$(QUANT).gguf
+HF_SMOL3_1B7_FILE  = SmolLM3-1.7B-Instruct-$(QUANT).gguf
+
+# Base CDN URL (hf-mirror works without login for public models)
+HF_BASE = https://huggingface.co
+
+define fetch_gguf
+	@mkdir -p $(MODELS_DIR)
+	@dest=$(MODELS_DIR)/$(2); \
+	url="$(HF_BASE)/$(1)/resolve/main/$(2)"; \
+	if [ -f "$$dest" ]; then \
+		echo "  SKIP  $$dest (already exists)"; \
+	elif command -v huggingface-cli >/dev/null 2>&1; then \
+		echo "  HF    $$dest"; \
+		huggingface-cli download $(1) $(2) --local-dir $(MODELS_DIR) \
+		  --local-dir-use-symlinks False; \
+	elif command -v curl >/dev/null 2>&1; then \
+		echo "  CURL  $$dest"; \
+		curl -L --progress-bar -o "$$dest" "$$url"; \
+	elif command -v wget >/dev/null 2>&1; then \
+		echo "  WGET  $$dest"; \
+		wget -q --show-progress -O "$$dest" "$$url"; \
+	else \
+		echo "ERROR: install huggingface-cli, curl, or wget"; exit 1; \
+	fi
+endef
+
+.PHONY: fetch-smol2-135m fetch-smol2-360m fetch-smol2-1.7b fetch-smol3-1.7b
+
+fetch-smol2-135m:
+	$(call fetch_gguf,$(HF_SMOL2_135M_REPO),$(HF_SMOL2_135M_FILE))
+	@echo "  OK    models/$(HF_SMOL2_135M_FILE)"
+	@echo "        set CMOL_TEST_GGUF=models/$(HF_SMOL2_135M_FILE) to run live tests"
+
+fetch-smol2-360m:
+	$(call fetch_gguf,$(HF_SMOL2_360M_REPO),$(HF_SMOL2_360M_FILE))
+	@echo "  OK    models/$(HF_SMOL2_360M_FILE)"
+
+fetch-smol2-1.7b:
+	$(call fetch_gguf,$(HF_SMOL2_1B7_REPO),$(HF_SMOL2_1B7_FILE))
+	@echo "  OK    models/$(HF_SMOL2_1B7_FILE)"
+
+fetch-smol3-1.7b:
+	$(call fetch_gguf,$(HF_SMOL3_1B7_REPO),$(HF_SMOL3_1B7_FILE))
+	@echo "  OK    models/$(HF_SMOL3_1B7_FILE)"
+
 # ── directories ───────────────────────────────────────────────────────────
 $(BUILD) $(BUILD_TESTS) $(BUILD_EX):
 	mkdir -p $@
@@ -97,3 +169,6 @@ $(BUILD) $(BUILD_TESTS) $(BUILD_EX):
 # ── clean ─────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BUILD) cmol_amalgam.h
+
+# models/ intentionally excluded from clean — re-downloading GGUFs is slow.
+# Use: rm -rf models/  to purge them manually.

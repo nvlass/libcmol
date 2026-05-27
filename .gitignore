@@ -1,4 +1,5 @@
 build/
+models/
 *.o
 *.a
 *.gguf
