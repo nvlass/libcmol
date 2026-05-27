@@ -157,18 +157,19 @@ Phase 4 (quant) unblocks Phase 5 (model/attention). Everything converges at Phas
 
 ---
 
-## Phase 1 — GGUF Parser (`gguf.c`)
+## Phase 1 — GGUF Parser (`gguf.c`) ✅
 
-- [ ] Parse GGUF magic + version (target v3; v1/v2 compatibility optional)
-- [ ] Parse metadata key-value store:
-  - [ ] Architecture hyperparams: `n_layers`, `n_heads`, `n_kv_heads` (GQA), `d_model`, `d_ffn`, `rope_freq_base`, `rms_norm_eps`, `context_length`
-  - [ ] Tokenizer metadata: vocab list, BPE merge rules, `bos_token_id`, `eos_token_id`, token types
-- [ ] Parse tensor descriptors: name → `{ dtype, shape[], rank, byte_offset }`
-  - Do **not** copy tensor data — record offsets into the mmap region
-- [ ] `cmol_gguf_find_tensor(ctx, name)` — lookup by name, returns pointer into mmap
-- [ ] `mmap` the whole file at load time; `munmap` on free
-- [ ] ⚠️ Respect `GGUF_DEFAULT_ALIGNMENT` (32 bytes) padding between tensors
-- [ ] Test: parse a real SmolLM3 GGUF, assert expected tensor names/shapes/dtypes
+- [x] Parse GGUF magic + version (target v3; v1/v2 compatibility optional)
+- [x] Parse metadata key-value store:
+  - [x] Architecture hyperparams: `n_layers`, `n_heads`, `n_kv_heads` (GQA), `d_model`, `d_ffn`, `rope_freq_base`, `rms_norm_eps`, `context_length`
+  - [x] Tokenizer metadata: vocab list, BPE merge rules, `bos_token_id`, `eos_token_id`, token types
+- [x] Parse tensor descriptors: name → `{ dtype, shape[], rank, byte_offset }`
+  - [x] Do **not** copy tensor data — record offsets into the mmap region
+- [x] `cmol_gguf_find_tensor(ctx, name)` — lookup by name, returns pointer into mmap
+- [x] `mmap` the whole file at load time; `munmap` on free
+- [x] ⚠️ Respect `GGUF_DEFAULT_ALIGNMENT` (32 bytes) padding between tensors
+- [x] Merge resolution: "piece_a piece_b" strings → (left_id, right_id) via sorted-index binary search
+- [ ] Test with real SmolLM3 GGUF (set `CMOL_TEST_GGUF=/path/to/model.gguf`)
 
 ---
 
