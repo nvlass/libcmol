@@ -56,7 +56,8 @@ static void bb_reserve(bb_t *b, size_t extra) {
     b->cap = nc;
 }
 
-static void bb_u8 (bb_t *b, uint8_t  v) { bb_reserve(b,1); b->buf[b->len++] = v; (void)bb_u8; }
+static void bb_u8 (bb_t *b, uint8_t  v) __attribute__((unused));
+static void bb_u8 (bb_t *b, uint8_t  v) { bb_reserve(b,1); b->buf[b->len++] = v; }
 static void bb_u32(bb_t *b, uint32_t v) { bb_reserve(b,4); memcpy(b->buf+b->len,&v,4); b->len+=4; }
 static void bb_u64(bb_t *b, uint64_t v) { bb_reserve(b,8); memcpy(b->buf+b->len,&v,8); b->len+=8; }
 static void bb_f32(bb_t *b, float    v) { bb_reserve(b,4); memcpy(b->buf+b->len,&v,4); b->len+=4; }
@@ -330,6 +331,93 @@ static void test_merges(void) {
 }
 
 /* =========================================================================
+ * Tests: dynamic architecture prefix  (smollm3.* keys)
+ * ====================================================================== */
+
+static void test_arch_prefix(void) {
+    SECTION("Architecture prefix (smollm3.* keys)");
+    bb_t b; bb_init(&b);
+
+    bb_u32(&b, 0x46554747u);
+    bb_u32(&b, 3);
+    bb_u64(&b, 0);   /* n_tensors */
+    bb_u64(&b, 5);   /* n_kv */
+
+    /* general.architecture must appear before arch-prefixed keys */
+    bb_str(&b, "general.architecture"); bb_u32(&b, 8); bb_str(&b, "smollm3");
+
+    bb_str(&b, "smollm3.block_count");
+        bb_u32(&b, 4); bb_u32(&b, 28);
+    bb_str(&b, "smollm3.embedding_length");
+        bb_u32(&b, 4); bb_u32(&b, 2048);
+    bb_str(&b, "smollm3.attention.head_count");
+        bb_u32(&b, 4); bb_u32(&b, 32);
+    bb_str(&b, "smollm3.attention.no_rope_layer_interval");
+        bb_u32(&b, 4); bb_u32(&b, 4);
+
+    cmol_hparams_t hp; cmol_tokenizer_t tok;
+    cmol_tensor_t *tensors; int n_tensors;
+
+    cmol_err_t e = parse_bytes(b.buf, b.len, &hp, &tok, &tensors, &n_tensors);
+    CHECK(e == CMOL_OK,                                   "smollm3 prefix parse OK");
+    CHECK(!strcmp(hp.arch, "smollm3"),                    "hp.arch = \"smollm3\"");
+    CHECK(hp.n_layers  == 28,                             "n_layers = 28");
+    CHECK(hp.d_model   == 2048,                           "d_model = 2048");
+    CHECK(hp.n_heads   == 32,                             "n_heads = 32");
+    CHECK(hp.no_rope_layer_interval == 4,                 "no_rope_layer_interval = 4");
+    bb_free(&b);
+}
+
+static void test_default_arch(void) {
+    SECTION("Default arch fallback (llama.* with no general.architecture)");
+    bb_t b; bb_init(&b);
+
+    bb_u32(&b, 0x46554747u);
+    bb_u32(&b, 3);
+    bb_u64(&b, 0);   /* n_tensors */
+    bb_u64(&b, 2);   /* n_kv — no general.architecture key */
+
+    bb_str(&b, "llama.block_count");
+        bb_u32(&b, 4); bb_u32(&b, 16);
+    bb_str(&b, "llama.embedding_length");
+        bb_u32(&b, 4); bb_u32(&b, 1024);
+
+    cmol_hparams_t hp; cmol_tokenizer_t tok;
+    cmol_tensor_t *tensors; int n_tensors;
+
+    cmol_err_t e = parse_bytes(b.buf, b.len, &hp, &tok, &tensors, &n_tensors);
+    CHECK(e == CMOL_OK,               "default arch parse OK");
+    CHECK(!strcmp(hp.arch, "llama"),  "hp.arch defaults to \"llama\"");
+    CHECK(hp.n_layers == 16,          "n_layers = 16");
+    CHECK(hp.d_model  == 1024,        "d_model = 1024");
+    bb_free(&b);
+}
+
+static void test_yarn_detection(void) {
+    SECTION("YARN rope scaling detection");
+    bb_t b; bb_init(&b);
+
+    bb_u32(&b, 0x46554747u);
+    bb_u32(&b, 3);
+    bb_u64(&b, 0);   /* n_tensors */
+    bb_u64(&b, 3);   /* n_kv */
+
+    bb_str(&b, "general.architecture"); bb_u32(&b, 8); bb_str(&b, "smollm3");
+    bb_str(&b, "smollm3.block_count");
+        bb_u32(&b, 4); bb_u32(&b, 28);
+    bb_str(&b, "smollm3.rope.scaling.type");
+        bb_u32(&b, 8); bb_str(&b, "yarn");
+
+    cmol_hparams_t hp; cmol_tokenizer_t tok;
+    cmol_tensor_t *tensors; int n_tensors;
+
+    cmol_err_t e = parse_bytes(b.buf, b.len, &hp, &tok, &tensors, &n_tensors);
+    CHECK(e == CMOL_OK,               "YARN GGUF parses OK");
+    CHECK(hp.yarn_factor_x100 == -1,  "YARN detected (yarn_factor_x100 = -1)");
+    bb_free(&b);
+}
+
+/* =========================================================================
  * Tests: real GGUF file  (opt-in via CMOL_TEST_GGUF env var)
  * ====================================================================== */
 
@@ -424,6 +512,9 @@ int main(void) {
     test_tokenizer_vocab();
     test_find_tensor();
     test_merges();
+    test_arch_prefix();
+    test_default_arch();
+    test_yarn_detection();
 
     const char *model_path = getenv("CMOL_TEST_GGUF");
     if (model_path)

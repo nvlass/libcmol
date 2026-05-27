@@ -60,18 +60,30 @@ typedef struct {
 
 typedef struct {
     int     n_layers;
-    int     n_heads;        /* query heads                                */
-    int     n_kv_heads;     /* key/value heads (< n_heads when GQA)       */
-    int     d_model;        /* embedding dimension                        */
-    int     d_head;         /* d_model / n_heads                          */
-    int     d_ffn;          /* feed-forward inner dimension               */
+    int     n_heads;               /* query heads                         */
+    int     n_kv_heads;            /* key/value heads (< n_heads for GQA) */
+    int     d_model;               /* embedding dimension                 */
+    int     d_head;                /* d_model / n_heads                   */
+    int     d_ffn;                 /* feed-forward inner dimension        */
     int     vocab_size;
-    int     model_max_ctx;  /* max context as reported in the GGUF        */
+    int     model_max_ctx;         /* max context as reported in the GGUF */
     float   rope_freq_base;
     float   rms_norm_eps;
     int32_t bos_token_id;
     int32_t eos_token_id;
-    int     tie_embeddings; /* 1 if lm_head shares weights with token_embd */
+    int     tie_embeddings;        /* 1 if lm_head == token_embd          */
+
+    /* SmolLM3 / NoPE hybrid: every no_rope_layer_interval-th layer
+     * skips RoPE entirely.  0 means standard RoPE on all layers.        */
+    int     no_rope_layer_interval;
+
+    /* YARN context extension (inference-time RoPE scaling).
+     * 0 = disabled (use native model_max_ctx).
+     * Phase 5 will implement the actual YARN computation.               */
+    int     yarn_factor_x100;      /* factor * 100, e.g. 200 for 2.0     */
+
+    /* Architecture string from general.architecture, e.g. "llama".     */
+    char    arch[32];
 } cmol_hparams_t;
 
 /* =========================================================================

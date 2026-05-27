@@ -26,7 +26,7 @@ TESTS       = $(patsubst tests/%.c,$(BUILD_TESTS)/%,$(TEST_SRCS))
 EXAMPLE_SRCS = $(wildcard examples/*.c)
 EXAMPLES     = $(patsubst examples/%.c,$(BUILD_EX)/%,$(EXAMPLE_SRCS))
 
-.PHONY: all debug release test examples amalgamate clean
+.PHONY: all debug release test examples amalgamate compdb clean
 
 all: debug
 
@@ -74,6 +74,21 @@ examples: $(BUILD)/cmol.o | $(BUILD_EX)
 amalgamate:
 	python3 tools/amalgamate.py > cmol_amalgam.h
 	@echo "  GEN   cmol_amalgam.h"
+
+# ── compile_commands.json for clangd ──────────────────────────────────────
+# Regenerate whenever sources change.  Runs the compiler in dry-run mode
+# (no -c/-o) so clangd gets correct include paths for every translation unit.
+COMPDB_FLAGS = -std=c99 -Wall -Wextra -Wpedantic -I$(CURDIR)/include -I$(CURDIR)/src
+compdb:
+	@python3 -c "\
+import json, glob, os; \
+root = '$(CURDIR)'; \
+flags = '$(COMPDB_FLAGS)'; \
+entries = []; \
+srcs = ['src/cmol.c'] + glob.glob('tests/test_*.c') + glob.glob('examples/*.c'); \
+[entries.append({'directory': root, 'command': 'cc ' + flags + ' ' + s, 'file': os.path.join(root, s)}) for s in srcs]; \
+open('compile_commands.json','w').write(json.dumps(entries, indent=2)); \
+print('  GEN   compile_commands.json (' + str(len(entries)) + ' entries)')"
 
 # ── directories ───────────────────────────────────────────────────────────
 $(BUILD) $(BUILD_TESTS) $(BUILD_EX):
