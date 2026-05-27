@@ -20,7 +20,7 @@
 #include "gguf.c"
 #include "tokenizer.c"
 #include "quant.c"
-#include "attn.c"
-#include "model.c"
+#include "model.c"   /* defines cmol__find_blk, cmol_rms_norm, cmol_rope_apply */
+#include "attn.c"    /* uses the above helpers; defines cmol_attn_forward       */
 #include "sampler.c"
 #include "api.c"
