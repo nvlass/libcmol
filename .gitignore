@@ -1,0 +1,6 @@
+build/
+*.o
+*.a
+*.gguf
+cmol_amalgam.h
+.DS_Store

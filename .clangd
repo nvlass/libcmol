@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -Iinclude
+    - -Isrc
+    - -std=c99
+    - -Wall
+    - -Wextra
