@@ -72,6 +72,7 @@ static const uint8_t GV_WIDTH[] = {1,1,2,2,4,4,4,1,0,0,8,8,8};
 #define K_TOK_SCORES  "tokenizer.ggml.scores"
 #define K_TOK_TYPES   "tokenizer.ggml.token_type"
 #define K_TOK_MERGES  "tokenizer.ggml.merges"
+#define K_TOK_MODEL   "tokenizer.ggml.model"
 #define K_TOK_BOS     "tokenizer.ggml.bos_token_id"
 #define K_TOK_EOS     "tokenizer.ggml.eos_token_id"
 #define K_TOK_UNK     "tokenizer.ggml.unknown_token_id"
@@ -359,6 +360,14 @@ static cmol_err_t read_kv(gcur_t *c, cmol_arena_t *a, char *arch,
         /* Skip unknown arrays */
         for (uint64_t i = 0; i < count && !c->err; i++)
             skip_scalar(c, et);
+        return c->err ? CMOL_ERR_INVALID : CMOL_OK;
+    }
+
+    /* ---- Tokenizer model name (controls pre-tokenization style) ------- */
+    if (vtype == GV_STRING && !strcmp(key, K_TOK_MODEL)) {
+        const char *s = gcur_str(c, a);
+        if (s) tok->tok_model = (strcmp(s, "llama") == 0) ? CMOL_TOK_LLAMA
+                                                           : CMOL_TOK_GPT2;
         return c->err ? CMOL_ERR_INVALID : CMOL_OK;
     }
 

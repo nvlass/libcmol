@@ -5,3 +5,4 @@ build/
 cmol_amalgam.h
 compile_commands.json
 .DS_Store
+.cache/

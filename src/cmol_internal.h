@@ -98,15 +98,21 @@ typedef enum {
     CMOL_TOKEN_BYTE    = 6,
 } cmol_token_type_t;
 
-typedef struct {
-    const char       **vocab;       /* [vocab_size] strings in arena      */
-    float             *scores;      /* [vocab_size] BPE merge scores      */
-    uint8_t           *token_type;  /* [vocab_size] cmol_token_type_t     */
-    int                vocab_size;
+/* Tokenizer pre-tokenization model (from tokenizer.ggml.model) */
+#define CMOL_TOK_LLAMA  0   /* SentencePiece BPE ("llama") — default       */
+#define CMOL_TOK_GPT2   1   /* Byte-level GPT-2 BPE ("gpt2", "qwen2", …)  */
 
-    /* BPE merge rules, sorted by priority (score descending).
-     * merge_left[i] + merge_right[i] -> merged token.
-     * Stored in arena; n_merges == vocab_size - 256 (roughly). */
+typedef struct {
+    /* ── raw data from GGUF parse (set by gguf.c) ──────────────────── */
+    const char       **vocab;        /* [vocab_size] BPE strings in arena  */
+    float             *scores;       /* [vocab_size] BPE merge scores      */
+    uint8_t           *token_type;   /* [vocab_size] cmol_token_type_t     */
+    int                vocab_size;
+    int                tok_model;    /* CMOL_TOK_LLAMA or CMOL_TOK_GPT2   */
+
+    /* BPE merge rules (index = priority; 0 = highest).
+     * merge_left[i] + merge_right[i] → some result token.
+     * Stored in arena; n_merges ≈ vocab_size - 256. */
     int32_t           *merge_left;
     int32_t           *merge_right;
     int                n_merges;
@@ -114,6 +120,12 @@ typedef struct {
     int32_t bos_id;
     int32_t eos_id;
     int32_t unk_id;
+
+    /* ── built by cmol_tokenizer_build() (set by tokenizer.c) ──────── */
+    const char       **decoded_vocab;   /* [vocab_size] ▁→space, <0xNN>→byte */
+    int32_t           *vocab_sort_idx;  /* [vocab_size] sorted for str→ID lookup */
+    int32_t           *merge_result;    /* [n_merges]   result token for merge i */
+    int32_t           *msort_idx;       /* [n_merges]   sorted for pair→rank lookup */
 } cmol_tokenizer_t;
 
 /* =========================================================================
