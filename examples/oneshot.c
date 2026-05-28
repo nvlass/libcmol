@@ -28,8 +28,11 @@ int main(int argc, char **argv) {
     cmol_model_t *m = cmol_load(argv[1], &cfg, &err);
     if (!m) { fprintf(stderr, "%s\n", cmol_strerror(err)); return 1; }
 
+    char prompt[4096];
+    cmol_format_chatml(NULL, argv[2], prompt, sizeof prompt);
+
     cmol_session_t *s = cmol_session_acquire(m);
-    cmol_err_t r = cmol_generate(s, argv[2], &params, on_token, NULL);
+    cmol_err_t r = cmol_generate(s, prompt, &params, on_token, NULL);
     putchar('\n');
 
     cmol_session_release(s);

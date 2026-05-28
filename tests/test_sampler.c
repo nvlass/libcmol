@@ -446,6 +446,85 @@ static void test_rng_uniformity(void) {
 }
 
 /* =========================================================================
+ * 9. Repetition penalty
+ * ====================================================================== */
+
+static void test_repeat_penalty(void) {
+    SECTION("Repetition penalty");
+
+    const int V = 8;
+    int i;
+
+    /* 1. Positive logits are divided by the penalty. */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = 2.0f;
+        int32_t tok[2] = {0, 3};
+        cmol_apply_repeat_penalty(l, V, tok, 2, 2.0f);
+        CHECK(NEAR(l[0], 1.0f),  "positive logit tok[0] halved");
+        CHECK(NEAR(l[3], 1.0f),  "positive logit tok[3] halved");
+        CHECK(NEAR(l[1], 2.0f),  "unreferenced tok[1] unchanged");
+    }
+
+    /* 2. Negative logits are multiplied by the penalty (pushed more negative). */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = -2.0f;
+        int32_t tok[1] = {5};
+        cmol_apply_repeat_penalty(l, V, tok, 1, 3.0f);
+        CHECK(NEAR(l[5], -6.0f), "negative logit tok[5] tripled");
+        CHECK(NEAR(l[2], -2.0f), "unreferenced tok[2] unchanged");
+    }
+
+    /* 3. Zero logit is treated as non-positive (≤ 0): multiplied. */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = 0.0f;
+        int32_t tok[1] = {4};
+        cmol_apply_repeat_penalty(l, V, tok, 1, 2.0f);
+        CHECK(NEAR(l[4], 0.0f),  "zero logit stays zero under penalty");
+    }
+
+    /* 4. penalty <= 1.0 is a no-op. */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = 5.0f;
+        int32_t tok[1] = {2};
+        cmol_apply_repeat_penalty(l, V, tok, 1, 1.0f);
+        CHECK(NEAR(l[2], 5.0f),  "penalty=1.0 is a no-op");
+        cmol_apply_repeat_penalty(l, V, tok, 1, 0.5f);
+        CHECK(NEAR(l[2], 5.0f),  "penalty<1.0 is a no-op");
+    }
+
+    /* 5. Out-of-range token IDs are skipped safely. */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = 3.0f;
+        int32_t tok[3] = {-1, V, 2};
+        cmol_apply_repeat_penalty(l, V, tok, 3, 2.0f);
+        CHECK(NEAR(l[2], 1.5f),  "valid id penalised; out-of-range skipped");
+        CHECK(NEAR(l[0], 3.0f),  "tok[-1] skipped — l[0] unchanged");
+    }
+
+    /* 6. Greedy sampling picks the highest-logit token; with a heavy penalty
+       on that token it should pick the next best instead. */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = (float)i;  /* best = 7 */
+        int32_t recent[1] = {7};
+        cmol_apply_repeat_penalty(l, V, recent, 1, 100.0f);
+        /* l[7] was 7.0, now 7/100 = 0.07 — well below l[6]=6.0 */
+        cmol_gen_params_t p = CMOL_DEFAULT_PARAMS;
+        p.temperature = 0.0f;  /* greedy */
+        int32_t chosen = cmol_sample(l, V, &p, NULL);
+        CHECK(chosen == 6, "greedy after heavy penalty picks next-best token");
+    }
+
+    /* 7. NULL / empty inputs are handled gracefully (no crash). */
+    {
+        float l[8]; for (i = 0; i < V; i++) l[i] = 1.0f;
+        cmol_apply_repeat_penalty(NULL, V, NULL, 0, 2.0f);
+        cmol_apply_repeat_penalty(l, V, NULL, 5, 2.0f);
+        cmol_apply_repeat_penalty(l, V, NULL, 0, 2.0f);
+        CHECK(NEAR(l[0], 1.0f),  "null/empty inputs: no crash, logits intact");
+    }
+}
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -460,6 +539,7 @@ int main(void) {
     test_topk_topp();
     test_edge_cases();
     test_rng_uniformity();
+    test_repeat_penalty();
 
     printf("\n=== %d/%d passed", g_pass, g_tests);
     if (g_fail) printf(", %d FAILED", g_fail);

@@ -464,9 +464,29 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
     uint64_t rng[4];
     cmol_rng_seed(rng, params->seed);
 
+    /* Repetition-penalty ring buffer — seed with tail of prompt tokens */
+    int32_t repeat_buf[CMOL_REPEAT_BUF];
+    int     repeat_head = 0;   /* next write position (wraps)  */
+    int     repeat_fill = 0;   /* entries currently valid       */
+    {
+        int last_n = params->repeat_last_n;
+        if (last_n <= 0 || last_n > CMOL_REPEAT_BUF) last_n = CMOL_REPEAT_BUF;
+        int seed_n = n_prompt < last_n ? n_prompt : last_n;
+        for (i = 0; i < seed_n; i++)
+            repeat_buf[i] = s->token_buf[n_prompt - seed_n + i];
+        repeat_head = seed_n % CMOL_REPEAT_BUF;
+        repeat_fill = seed_n;
+    }
+
     int n_generated = 0;
 
     for (;;) {
+        /* ── Repetition penalty (applied before temperature / softmax) ── */
+        if (params->repeat_penalty > 1.0f && repeat_fill > 0)
+            cmol_apply_repeat_penalty(logits, hp->vocab_size,
+                                      repeat_buf, repeat_fill,
+                                      params->repeat_penalty);
+
         /* ── Sample next token ─────────────────────────────────────────── */
         int32_t next_tok = cmol_sample(logits, hp->vocab_size, params, rng);
 
@@ -483,6 +503,11 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
         }
 
         if (is_eos) break;
+
+        /* ── Push generated token into repeat window ──────────────────── */
+        repeat_buf[repeat_head] = next_tok;
+        repeat_head = (repeat_head + 1) % CMOL_REPEAT_BUF;
+        if (repeat_fill < CMOL_REPEAT_BUF) repeat_fill++;
 
         n_generated++;
         if (max_new > 0 && n_generated >= max_new) break;

@@ -36,6 +36,8 @@ int main(int argc, char **argv) {
     cmol_session_t *s = cmol_session_acquire(m);
 
     char line[2048];
+    char prompt[4096];
+    int  turn = 0;
     printf("libcmol %s  —  type a prompt, empty line to quit\n\n",
            cmol_version());
 
@@ -43,7 +45,15 @@ int main(int argc, char **argv) {
         line[strcspn(line, "\n")] = '\0';
         if (!*line) break;
 
-        cmol_err_t r = cmol_generate(s, line, &params, on_token, NULL);
+        /* Wrap in ChatML — first turn includes system message, later turns
+           append only the new user+assistant markers (KV cache holds context). */
+        if (turn == 0)
+            cmol_format_chatml(NULL, line, prompt, sizeof prompt);
+        else
+            cmol_format_chatml_turn(line, prompt, sizeof prompt);
+        turn++;
+
+        cmol_err_t r = cmol_generate(s, prompt, &params, on_token, NULL);
         if (r != CMOL_OK)
             fprintf(stderr, "generate: %s\n", cmol_strerror(r));
     }

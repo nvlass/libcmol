@@ -33,13 +33,15 @@ all: debug
 # ── debug (ASAN + UBSAN, no optimisation) ────────────────────────────────
 debug: $(BUILD)/cmol_d.o
 
-$(BUILD)/cmol_d.o: $(LIB_SRC) | $(BUILD)
+UNITY_DEPS = $(wildcard src/*.c src/*.h include/*.h)
+
+$(BUILD)/cmol_d.o: $(LIB_SRC) $(UNITY_DEPS) | $(BUILD)
 	$(CC) $(CFLAGS) $(DFLAGS) -c $< -o $@
 
 # ── release (optimised static library) ───────────────────────────────────
 release: $(BUILD)/libcmol.a
 
-$(BUILD)/cmol.o: $(LIB_SRC) | $(BUILD)
+$(BUILD)/cmol.o: $(LIB_SRC) $(UNITY_DEPS) | $(BUILD)
 	$(CC) $(CFLAGS) $(RFLAGS) -c $< -o $@
 
 $(BUILD)/libcmol.a: $(BUILD)/cmol.o

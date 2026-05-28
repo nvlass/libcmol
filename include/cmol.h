@@ -113,11 +113,16 @@ typedef struct {
     int          top_k;          /* 0 = disabled                          */
     int          max_new_tokens; /* -1 = generate until EOS               */
     unsigned int seed;           /* 0 = non-deterministic                 */
+    float        repeat_penalty; /* > 1.0 penalises recently-seen tokens; */
+                                 /* 1.0 = disabled                        */
+    int          repeat_last_n;  /* window of recent tokens to penalise;  */
+                                 /* clamped to CMOL_REPEAT_BUF (128)      */
 } cmol_gen_params_t;
 
 #define CMOL_DEFAULT_PARAMS \
     { .temperature = 0.8f, .top_p = 0.95f, .top_k = 40, \
-      .max_new_tokens = 256, .seed = 0 }
+      .max_new_tokens = 256, .seed = 0, \
+      .repeat_penalty = 1.1f, .repeat_last_n = 64 }
 
 /* =========================================================================
  * Opaque handle types

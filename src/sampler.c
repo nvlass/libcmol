@@ -165,6 +165,25 @@ static int topk_select(const float *probs, int V, int k,
 }
 
 /* =========================================================================
+ * cmol_apply_repeat_penalty
+ * ====================================================================== */
+
+void cmol_apply_repeat_penalty(float *logits, int vocab_size,
+                                const int32_t *tokens, int n_tokens,
+                                float penalty) {
+    int i;
+    if (penalty <= 1.0f || !logits || !tokens || n_tokens <= 0) return;
+    for (i = 0; i < n_tokens; i++) {
+        int32_t id = tokens[i];
+        if (id < 0 || id >= vocab_size) continue;
+        if (logits[id] > 0.0f)
+            logits[id] /= penalty;
+        else
+            logits[id] *= penalty;
+    }
+}
+
+/* =========================================================================
  * cmol_sample
  * ====================================================================== */
 

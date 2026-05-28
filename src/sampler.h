@@ -33,4 +33,23 @@ void cmol_rng_seed(uint64_t state[4], unsigned int seed);
 /* cmol_rng_next — return the next 64-bit value and advance the state. */
 uint64_t cmol_rng_next(uint64_t state[4]);
 
+/*
+ * cmol_apply_repeat_penalty — discount logits of recently-seen tokens.
+ *
+ * Applies the standard llama.cpp repetition penalty formula in-place,
+ * before temperature scaling and softmax:
+ *   logit > 0  →  logit /= penalty
+ *   logit ≤ 0  →  logit *= penalty
+ *
+ * `tokens`   — ring buffer of the last N generated/prompt tokens (IDs).
+ *              Any entry with id < 0 or id >= vocab_size is skipped.
+ * `n_tokens` — number of valid entries in `tokens` (≤ CMOL_REPEAT_BUF).
+ * `penalty`  — multiplier; values ≤ 1.0f are a no-op.
+ */
+#define CMOL_REPEAT_BUF 128
+
+void cmol_apply_repeat_penalty(float *logits, int vocab_size,
+                                const int32_t *tokens, int n_tokens,
+                                float penalty);
+
 #endif /* CMOL_SAMPLER_H */
