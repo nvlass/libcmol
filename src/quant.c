@@ -75,6 +75,13 @@ static inline float f16_to_f32(uint16_t h) {
 #  define CMOL_PACKED  /* MSVC: use #pragma pack(push,1) around structs */
 #endif
 
+/* Q5_0 — 22 bytes */
+typedef struct CMOL_PACKED {
+    uint16_t d;       /* float16 scale                  */
+    uint8_t  qh[4];   /* 5th bit of each of 32 values   */
+    int8_t   qs[16];  /* lower 4 bits, 2 values/byte    */
+} q5_0_block_t;
+
 /* Q8_0 — 34 bytes */
 typedef struct CMOL_PACKED {
     uint16_t d;       /* float16 scale                  */
@@ -98,6 +105,7 @@ typedef struct CMOL_PACKED {
 } q6_k_block_t;
 
 /* Compile-time size checks */
+typedef char chk_q5_0[(sizeof(q5_0_block_t)  == 22)  ? 1 : -1];
 typedef char chk_q8_0[(sizeof(q8_0_block_t)  == 34)  ? 1 : -1];
 typedef char chk_q4_k[(sizeof(q4_k_block_t)  == 144) ? 1 : -1];
 typedef char chk_q6_k[(sizeof(q6_k_block_t)  == 210) ? 1 : -1];
@@ -133,6 +141,28 @@ static inline void q4k_get_scale_min(int j, const uint8_t *s,
  * in the SIMD kernel functions.
  * ====================================================================== */
 
+/*
+ * Q5_0 block layout:
+ *   qs[j]  holds the lower nibble  of value j       (j = 0..15, first  half)
+ *              and the upper nibble of value j + 16  (j = 0..15, second half).
+ *   qh bits 0-15  hold the 5th bit of values  0-15 (bit j → value j).
+ *   qh bits 16-31 hold the 5th bit of values 16-31 (bit j+16 → value j+16).
+ * Combined value [0..31] → subtract 16 → signed [-16..15].
+ */
+static void dequant_block_q5_0(const q5_0_block_t *b, float *dst) {
+    float    d = f16_to_f32(b->d);
+    uint32_t qh;
+    int      j;
+    memcpy(&qh, b->qh, 4);
+    for (j = 0; j < 16; j++) {
+        uint8_t xh0 = (uint8_t)(((qh >>  j)      & 1u) << 4);
+        uint8_t xh1 = (uint8_t)(((qh >> (j + 16)) & 1u) << 4);
+        uint8_t q   = (uint8_t)b->qs[j]; /* cast to unsigned before shifting */
+        dst[j]      = d * (float)((int)((q & 0x0Fu) | xh0) - 16);
+        dst[j + 16] = d * (float)((int)((q >>  4  ) | xh1) - 16);
+    }
+}
+
 static void dequant_block_q8_0(const q8_0_block_t *b, float *dst) {
     float d = f16_to_f32(b->d);
     int i;
@@ -150,10 +180,15 @@ static void dequant_block_q4_k(const q4_k_block_t *b, float *dst) {
         float db = d    * (float)sc;
         float mb = dmin * (float)mn;
 
-        const uint8_t *q = b->qs + sub * 16;
-        for (k = 0; k < 16; k++) {
-            dst[sub * 32 + k * 2 + 0] = db * (float)(q[k] & 0xF) - mb;
-            dst[sub * 32 + k * 2 + 1] = db * (float)(q[k] >> 4)  - mb;
+        /* Pairs of sub-blocks share the same 32-byte qs chunk:
+         *   sub 0,1 → qs[  0.. 31]   sub 2,3 → qs[ 32.. 63]
+         *   sub 4,5 → qs[ 64.. 95]   sub 6,7 → qs[ 96..127]
+         * Even sub → lower nibble (shift 0); odd sub → upper nibble (shift 4).
+         * Matches llama.cpp dequantize_row_q4_K (64-value inner loop). */
+        const uint8_t *q = b->qs + (sub / 2) * 32;
+        int shift = (sub & 1) ? 4 : 0;
+        for (k = 0; k < 32; k++) {
+            dst[sub * 32 + k] = db * (float)((q[k] >> shift) & 0xFu) - mb;
         }
     }
 }
@@ -162,10 +197,36 @@ static void dequant_block_q6_k(const q6_k_block_t *b, float *dst) {
     float d = f16_to_f32(b->d);
     int i;
 
+    /*
+     * Q6_K output ordering — derived from llama.cpp dequantize_row_q6_K.
+     * The 256 outputs are arranged in 8 groups of 32 (g8 = i/32, j32 = i%32):
+     *
+     * ql (128 bytes):
+     *   g8  0,1 → bytes   0-31,  32-63  lower nibble (& 0xF)
+     *   g8  2,3 → bytes   0-31,  32-63  upper nibble (>> 4)
+     *   g8  4,5 → bytes  64-95,  96-127 lower nibble
+     *   g8  6,7 → bytes  64-95,  96-127 upper nibble
+     *   Compact: ql_idx = (g8<4 ? 0 : 64) + (g8&1)*32 + j32
+     *            ql_shift = (g8&2) ? 4 : 0
+     *
+     * qh (64 bytes): 2-bit groups, two bit-pairs per byte
+     *   g8  0-3 → qh[ 0..31], bit-pair (g8%4)*2
+     *   g8  4-7 → qh[32..63], bit-pair (g8%4)*2
+     *   Compact: qh_idx = (g8<4 ? 0 : 32) + j32
+     *            qh_shift = (g8 & 3) * 2
+     *
+     * scales: 16 int8 scale values, one per 16 outputs → scales[i/16]
+     */
     for (i = 0; i < 256; i++) {
-        uint8_t lo = (b->ql[i / 2] >> ((i & 1) * 4)) & 0xFu;
-        uint8_t hi = (b->qh[i / 4] >> ((i & 3) * 2)) & 0x3u;
-        int8_t  q  = (int8_t)((int)(lo | ((unsigned)hi << 4)) - 32);
+        int     g8     = i / 32;
+        int     j32    = i % 32;
+        int     ql_idx = (g8 < 4 ? 0 : 64) + (g8 & 1) * 32 + j32;
+        int     ql_sh  = (g8 & 2) ? 4 : 0;
+        uint8_t lo     = (b->ql[ql_idx] >> ql_sh) & 0xFu;
+        int     qh_idx = (g8 < 4 ? 0 : 32) + j32;
+        int     qh_sh  = (g8 & 3) * 2;
+        uint8_t hi     = (b->qh[qh_idx] >> qh_sh) & 0x3u;
+        int     q      = (int)(lo | ((unsigned)hi << 4)) - 32;
         dst[i] = d * (float)b->scales[i / 16] * (float)q;
     }
 }
@@ -191,6 +252,13 @@ void cmol_dequant_row(const void *src, float *dst, int n, cmol_dtype_t dtype) {
         const uint16_t *s = (const uint16_t *)src;
         int i;
         for (i = 0; i < n; i++) dst[i] = f16_to_f32(s[i]);
+        break;
+    }
+
+    case CMOL_DTYPE_Q5_0: {
+        const q5_0_block_t *b = (const q5_0_block_t *)src;
+        int bi, nb = n / 32;
+        for (bi = 0; bi < nb; bi++) dequant_block_q5_0(&b[bi], dst + bi * 32);
         break;
     }
 
@@ -231,6 +299,7 @@ static inline int block_params(cmol_dtype_t dtype, size_t *bsz) {
     switch (dtype) {
     case CMOL_DTYPE_F32:  *bsz = sizeof(float);          return 1;
     case CMOL_DTYPE_F16:  *bsz = sizeof(uint16_t);       return 1;
+    case CMOL_DTYPE_Q5_0: *bsz = sizeof(q5_0_block_t);   return 32;
     case CMOL_DTYPE_Q8_0: *bsz = sizeof(q8_0_block_t);   return 32;
     case CMOL_DTYPE_Q4_K: *bsz = sizeof(q4_k_block_t);   return 256;
     case CMOL_DTYPE_Q6_K: *bsz = sizeof(q6_k_block_t);   return 256;
@@ -242,6 +311,7 @@ static inline int block_params(cmol_dtype_t dtype, size_t *bsz) {
  * Assumes `blk` is correctly aligned (it comes from the GGUF mmap). */
 static inline void dequant_block(const void *blk, float *tmp, cmol_dtype_t dtype) {
     switch (dtype) {
+    case CMOL_DTYPE_Q5_0: dequant_block_q5_0((const q5_0_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q8_0: dequant_block_q8_0((const q8_0_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q4_K: dequant_block_q4_k((const q4_k_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q6_K: dequant_block_q6_k((const q6_k_block_t *)blk, tmp); break;

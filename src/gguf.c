@@ -76,6 +76,7 @@ static const uint8_t GV_WIDTH[] = {1,1,2,2,4,4,4,1,0,0,8,8,8};
 #define K_TOK_BOS     "tokenizer.ggml.bos_token_id"
 #define K_TOK_EOS     "tokenizer.ggml.eos_token_id"
 #define K_TOK_UNK     "tokenizer.ggml.unknown_token_id"
+#define K_TOK_ADD_BOS "tokenizer.ggml.add_bos_token"
 
 /* =========================================================================
  * Dynamic key matching
@@ -131,6 +132,7 @@ static T gcur_##suffix(gcur_t *c) {                       \
 
 /* Instantiate only the readers used in gguf.c.
  * Phase 4 (quant.c) will add the remaining widths as needed. */
+GCUR_READ_FN(uint8_t,  u8)
 GCUR_READ_FN(uint32_t, u32)
 GCUR_READ_FN(int32_t,  i32)
 GCUR_READ_FN(uint64_t, u64)
@@ -333,6 +335,14 @@ static cmol_err_t read_kv(gcur_t *c, cmol_arena_t *a, char *arch,
         return CMOL_OK;
     }
 
+    /* ---- Scalar bool (GV_BOOL = 1 byte) ------------------------------- */
+    if (vtype == GV_BOOL) {
+        uint8_t v = gcur_u8(c);
+        if (c->err) return CMOL_ERR_INVALID;
+        if (!strcmp(key, K_TOK_ADD_BOS)) tok->add_bos = v ? 1 : 0;
+        return CMOL_OK;
+    }
+
     /* ---- Architecture-prefixed scalar float32 ------------------------ */
     if (vtype == GV_FLOAT32) {
         float v = gcur_f32(c);
@@ -392,6 +402,7 @@ static size_t tensor_nbytes(cmol_dtype_t dtype, int64_t n_elems) {
     switch (dtype) {
         case CMOL_DTYPE_F32:  return (size_t)n_elems * 4;
         case CMOL_DTYPE_F16:  return (size_t)n_elems * 2;
+        case CMOL_DTYPE_Q5_0: return (size_t)(n_elems / 32)  * 22;
         case CMOL_DTYPE_Q8_0: return (size_t)(n_elems / 32)  * 34;
         case CMOL_DTYPE_Q4_K: return (size_t)(n_elems / 256) * 144;
         case CMOL_DTYPE_Q6_K: return (size_t)(n_elems / 256) * 210;
@@ -458,6 +469,7 @@ cmol_err_t cmol_gguf_parse(const cmol_mmap_t *mmap,
     hp->rope_freq_base = 10000.0f;
     hp->rms_norm_eps   = 1e-5f;
     tok->bos_id = tok->eos_id = tok->unk_id = -1;
+    tok->add_bos = 1;  /* conservative default; overridden by tokenizer.ggml.add_bos_token */
 
     /* Architecture prefix — default "llama", overwritten by general.architecture */
     char arch[32] = "llama";

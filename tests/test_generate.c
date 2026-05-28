@@ -123,6 +123,62 @@ static void test_encode_null_guards(void) {
     CHECK(p == NULL, "decode NULL model → NULL");
 }
 
+static void test_chatml_format(void) {
+    char buf[512];
+    int  n;
+
+    printf("\n[cmol_format_chatml — default system message]\n");
+    n = cmol_format_chatml(NULL, "Hi", buf, sizeof buf);
+    CHECK(n > 0, "returns positive length");
+    CHECK(strstr(buf, "<|im_start|>system\n") != NULL,
+          "contains system block");
+    CHECK(strstr(buf, "SmolLM") != NULL, "contains 'SmolLM' default");
+    CHECK(strstr(buf, "<|im_start|>user\nHi<|im_end|>") != NULL,
+          "contains user message");
+    CHECK(strstr(buf, "<|im_start|>assistant\n") != NULL,
+          "ends with assistant header");
+
+    printf("\n[cmol_format_chatml — custom system message]\n");
+    n = cmol_format_chatml("Be brief.", "Hi", buf, sizeof buf);
+    CHECK(n > 0, "returns positive length");
+    CHECK(strstr(buf, "<|im_start|>system\nBe brief.<|im_end|>") != NULL,
+          "custom system text present");
+
+    printf("\n[cmol_format_chatml — empty system (omit block)]\n");
+    n = cmol_format_chatml("", "Hi", buf, sizeof buf);
+    CHECK(n > 0, "returns positive length");
+    CHECK(strstr(buf, "system") == NULL, "no system block when sys=''");
+    CHECK(strstr(buf, "<|im_start|>user\nHi<|im_end|>") != NULL,
+          "user message still present");
+
+    printf("\n[cmol_format_chatml_turn]\n");
+    n = cmol_format_chatml_turn("Next question", buf, sizeof buf);
+    CHECK(n > 0, "turn: returns positive length");
+    CHECK(strstr(buf, "<|im_end|>\n<|im_start|>user\n") != NULL,
+          "turn: closes previous + opens user");
+    CHECK(strstr(buf, "<|im_start|>assistant\n") != NULL,
+          "turn: ends with assistant header");
+
+    printf("\n[cmol_format_chatml — size probe]\n");
+    n = cmol_format_chatml(NULL, "Hi", NULL, 0);
+    CHECK(n > 0, "probe: returns positive size (not error)");
+    /* Exact re-check: the real write should give same n */
+    int n2 = cmol_format_chatml(NULL, "Hi", buf, sizeof buf);
+    CHECK(n == n2, "probe matches real write length");
+
+    printf("\n[cmol_format_chatml — truncation]\n");
+    char small[4];
+    n = cmol_format_chatml(NULL, "Hi", small, sizeof small);
+    CHECK(n == (int)CMOL_ERR_TRUNC, "small buffer → CMOL_ERR_TRUNC");
+    CHECK(small[sizeof small - 1] == '\0', "buffer NUL-terminated on truncation");
+
+    printf("\n[cmol_format_chatml — NULL user guard]\n");
+    n = cmol_format_chatml(NULL, NULL, buf, sizeof buf);
+    CHECK(n == (int)CMOL_ERR_ARGS, "NULL user → CMOL_ERR_ARGS");
+    n = cmol_format_chatml_turn(NULL, buf, sizeof buf);
+    CHECK(n == (int)CMOL_ERR_ARGS, "turn NULL user → CMOL_ERR_ARGS");
+}
+
 /* =========================================================================
  * Section 2: live tests — require CMOL_TEST_GGUF
  * ====================================================================== */
@@ -394,6 +450,7 @@ int main(void) {
     test_generate_null_args();
     test_arena_estimate_null();
     test_encode_null_guards();
+    test_chatml_format();
 
 #ifdef CMOL_TEST_GGUF
     /* ── Live tests ─────────────────────────────────────────────────────── */

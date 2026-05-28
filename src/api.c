@@ -340,12 +340,64 @@ void cmol_session_reset(cmol_session_t *s) {
 int cmol_encode(cmol_model_t *m, const char *text,
                 int32_t *out, int out_cap) {
     if (!m || !text || !out || out_cap <= 0) return CMOL_ERR_ARGS;
-    return cmol_tokenizer_encode(&m->tokenizer, text, out, out_cap, /*add_bos=*/1);
+    return cmol_tokenizer_encode(&m->tokenizer, text, out, out_cap,
+                                 m->tokenizer.add_bos);
 }
 
 const char *cmol_decode_token(cmol_model_t *m, int32_t token_id) {
     if (!m) return NULL;
     return cmol_tokenizer_decode_token(&m->tokenizer, token_id);
+}
+
+/* =========================================================================
+ * ChatML prompt formatting helpers
+ * ====================================================================== */
+
+#define CMOL__DEFAULT_SYSTEM \
+    "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
+
+int cmol_format_chatml(const char *system, const char *user,
+                        char *buf, size_t buf_cap) {
+    int n;
+    if (!user) return (int)CMOL_ERR_ARGS;
+
+    /* NULL  → SmolLM default system prompt
+     * ""    → omit system turn
+     * other → use verbatim                  */
+    const char *sys = (system == NULL) ? CMOL__DEFAULT_SYSTEM : system;
+
+    if (sys[0] != '\0') {
+        n = snprintf(buf, buf_cap,
+            "<|im_start|>system\n%s<|im_end|>\n"
+            "<|im_start|>user\n%s<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            sys, user);
+    } else {
+        n = snprintf(buf, buf_cap,
+            "<|im_start|>user\n%s<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            user);
+    }
+
+    if (n < 0) return (int)CMOL_ERR_ARGS;
+    if (buf && buf_cap > 0 && (size_t)n >= buf_cap) return (int)CMOL_ERR_TRUNC;
+    return n;
+}
+
+int cmol_format_chatml_turn(const char *user, char *buf, size_t buf_cap) {
+    int n;
+    if (!user) return (int)CMOL_ERR_ARGS;
+
+    /* Close the previous (open) assistant turn, then open the new user turn. */
+    n = snprintf(buf, buf_cap,
+        "<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        user);
+
+    if (n < 0) return (int)CMOL_ERR_ARGS;
+    if (buf && buf_cap > 0 && (size_t)n >= buf_cap) return (int)CMOL_ERR_TRUNC;
+    return n;
 }
 
 /* =========================================================================
@@ -381,7 +433,7 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
     int n_prompt = cmol_tokenizer_encode(
             &m->tokenizer, prompt,
             s->token_buf, s->token_buf_cap,
-            /*add_bos=*/1);
+            m->tokenizer.add_bos);
     if (n_prompt < 0)  return (cmol_err_t)n_prompt;
     if (n_prompt == 0) return CMOL_OK;
 
@@ -419,7 +471,8 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
         int32_t next_tok = cmol_sample(logits, hp->vocab_size, params, rng);
 
         /* ── Decode + fire callback ────────────────────────────────────── */
-        int is_eos = (next_tok == hp->eos_token_id);
+        int is_eos = (m->tokenizer.eos_id >= 0 &&
+                      next_tok == m->tokenizer.eos_id);
 
         if (on_token) {
             const char *piece = cmol_tokenizer_decode_token(&m->tokenizer,

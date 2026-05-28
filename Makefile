@@ -12,7 +12,7 @@ RFLAGS += -march=native
 # Pthreads — Linux needs -lpthread; macOS has it in libc.
 UNAME   := $(shell uname -s)
 ifeq ($(UNAME), Linux)
-    LDFLAGS += -lpthread
+    LDFLAGS += -lpthread -lm
 endif
 
 LIB_SRC     = src/cmol.c

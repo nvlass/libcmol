@@ -129,12 +129,19 @@ static void test_dequant_q8_0(void) {
 /* =========================================================================
  * 3. cmol_dequant_row — Q4_K
  *
+ * Correct llama.cpp layout: sub-blocks 0 and 1 both consume qs[0..31],
+ * sub 0 → lower nibbles, sub 1 → upper nibbles.
+ *
  * Super-block: d=1.0, dmin=0.0
- * scales = {1,0,...,0} → sub-block 0: sc=1, mn=0; rest: sc=0
- * qs[0] = 0xA3  → nibble 0 = 3, nibble 1 = 10 (0xA)
- * Expected: dst[0] = 1.0*1*3 = 3.0, dst[1] = 1.0*1*10 = 10.0,
- *           dst[2..31] = 0.0 (rest of sub-block 0: qs[1..15] = 0)
- *           dst[32..255] = 0.0 (sub-blocks 1-7 have sc=0)
+ * scales = {1,1,0,...,0} → sub-block 0: sc=1; sub-block 1: sc=1; rest: sc=0
+ * qs[0] = 0xA3 → lower nibble = 3, upper nibble = 10 (0xA)
+ *
+ * Expected:
+ *   dst[0]  = sc[0]*lower(qs[0]) = 1*3 = 3.0  (sub-block 0, pos 0)
+ *   dst[1]  = sc[0]*lower(qs[1]) = 1*0 = 0.0  (sub-block 0, pos 1; qs[1]=0)
+ *   dst[2]  = 0.0 (qs[2]=0)
+ *   dst[32] = sc[1]*upper(qs[0]) = 1*10 = 10.0 (sub-block 1, pos 0)
+ *   dst[255]= 0.0 (sub-blocks 2-7: sc=0)
  * ====================================================================== */
 
 static void test_dequant_q4_k(void) {
@@ -145,19 +152,21 @@ static void test_dequant_q4_k(void) {
     blk.d    = f32_to_f16_test(1.0f);
     blk.dmin = f32_to_f16_test(0.0f);
 
-    /* scales[0] = 1 → sub-block 0 gets sc=1, mn=scales[4]&0x3F=0 */
+    /* sub-block 0 (lower nibbles of qs[0..31]): sc=1, mn=0 */
     blk.scales[0] = 1;
+    /* sub-block 1 (upper nibbles of qs[0..31]): sc=1, mn=0 */
+    blk.scales[1] = 1;
 
-    /* qs[0] = low=3 high=10 → values 3 and 10 */
+    /* qs[0]: lower nibble=3, upper nibble=10 */
     blk.qs[0] = (uint8_t)((10u << 4) | 3u);
 
     float dst[256] = { 0 };
     cmol_dequant_row(&blk, dst, 256, CMOL_DTYPE_Q4_K);
 
     CHECK(NEAR(dst[0],  3.0f),  "Q4_K dst[0] = 3.0");
-    CHECK(NEAR(dst[1], 10.0f),  "Q4_K dst[1] = 10.0");
+    CHECK(NEAR(dst[1],  0.0f),  "Q4_K dst[1] = 0.0 (qs[1]=0, lower nibble)");
     CHECK(NEAR(dst[2],  0.0f),  "Q4_K dst[2] = 0.0 (qs[1]=0)");
-    CHECK(NEAR(dst[32], 0.0f),  "Q4_K dst[32]= 0.0 (sc=0 for sub-block 1)");
+    CHECK(NEAR(dst[32],10.0f),  "Q4_K dst[32]= 10.0 (upper nibble of qs[0], sub 1)");
     CHECK(NEAR(dst[255],0.0f),  "Q4_K dst[255]=0.0");
 }
 

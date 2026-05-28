@@ -96,6 +96,93 @@ static int32_t find_merge_rank(const cmol_tokenizer_t *tok,
 }
 
 /* =========================================================================
+ * UTF-8 helpers
+ * ====================================================================== */
+
+/* Returns the byte length of the UTF-8 sequence that starts with byte `c`. */
+static int utf8_seqlen(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1; /* invalid / continuation byte — treat as 1 */
+}
+
+/* Parse one UTF-8 codepoint from *p, advancing *p past it. */
+static unsigned int utf8_next_cp(const char **p) {
+    const unsigned char *u = (const unsigned char *)*p;
+    unsigned int cp; int seqlen, i;
+    if (!u || !*u) return 0;
+    if      (u[0] < 0x80u) { cp = u[0]; seqlen = 1; }
+    else if (u[0] < 0xC0u) { (*p)++; return 0xFFFDu; } /* bare continuation */
+    else if (u[0] < 0xE0u) { cp = u[0] & 0x1Fu; seqlen = 2; }
+    else if (u[0] < 0xF0u) { cp = u[0] & 0x0Fu; seqlen = 3; }
+    else                   { cp = u[0] & 0x07u; seqlen = 4; }
+    for (i = 1; i < seqlen; i++) {
+        if ((u[i] & 0xC0u) != 0x80u) break; /* truncated */
+        cp = (cp << 6) | (u[i] & 0x3Fu);
+    }
+    *p += seqlen;
+    return cp;
+}
+
+/* Encode Unicode codepoint cp as UTF-8 into buf[]; return byte length (1-4). */
+static int cp_to_utf8(unsigned int cp, char buf[4]) {
+    if (cp < 0x80u) {
+        buf[0] = (char)cp; return 1;
+    } else if (cp < 0x800u) {
+        buf[0] = (char)(0xC0u | (cp >> 6));
+        buf[1] = (char)(0x80u | (cp & 0x3Fu)); return 2;
+    } else if (cp < 0x10000u) {
+        buf[0] = (char)(0xE0u | (cp >> 12));
+        buf[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        buf[2] = (char)(0x80u | (cp & 0x3Fu)); return 3;
+    } else {
+        buf[0] = (char)(0xF0u | (cp >> 18));
+        buf[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        buf[2] = (char)(0x80u | ((cp >> 6)  & 0x3Fu));
+        buf[3] = (char)(0x80u | (cp & 0x3Fu)); return 4;
+    }
+}
+
+/* =========================================================================
+ * GPT-2 byte-to-unicode mapping
+ *
+ * GPT-2 represents each byte 0x00-0xFF as a single Unicode codepoint so
+ * that every byte sequence has a lossless text representation:
+ *
+ *   "Kept" bytes (map to themselves):
+ *     0x21-0x7E  (printable ASCII: '!' to '~')
+ *     0xA1-0xAC  (¡ to ¬)
+ *     0xAE-0xFF  (® to ÿ)
+ *
+ *   "Extra" bytes (68 values, mapped to U+0100..U+0143 in byte-value order):
+ *     0x00-0x20  → U+0100-U+0120  (U+0120 = Ġ = space 0x20)
+ *     0x7F       → U+0121
+ *     0x80-0xA0  → U+0122-U+0142
+ *     0xAD       → U+0143
+ * ====================================================================== */
+
+/* Input byte → GPT-2 Unicode codepoint. */
+static unsigned int gpt2_byte_to_cp(unsigned char b) {
+    if (b <= 0x20u)              return 0x0100u + b;          /* 0x00-0x20 */
+    if (b <= 0x7Eu)              return b;                    /* 0x21-0x7E */
+    if (b == 0x7Fu)              return 0x0121u;
+    if (b <= 0xA0u)              return 0x0122u + (b - 0x80u); /* 0x80-0xA0 */
+    if (b == 0xADu)              return 0x0143u;
+    return b;                                                  /* kept */
+}
+
+/* GPT-2 Unicode codepoint → original byte (inverse of gpt2_byte_to_cp). */
+static unsigned char gpt2_cp_to_byte(unsigned int cp) {
+    if (cp >= 0x0100u && cp <= 0x0120u) return (unsigned char)(cp - 0x0100u);
+    if (cp == 0x0121u)                  return 0x7Fu;
+    if (cp >= 0x0122u && cp <= 0x0142u) return (unsigned char)(0x80u + (cp - 0x0122u));
+    if (cp == 0x0143u)                  return 0xADu;
+    return (unsigned char)(cp & 0xFFu); /* kept bytes pass through */
+}
+
+/* =========================================================================
  * cmol_tokenizer_build
  * ====================================================================== */
 
@@ -176,6 +263,43 @@ cmol_err_t cmol_tokenizer_build(cmol_tokenizer_t *tok, cmol_arena_t *arena) {
     for (int i = 0; i < V; i++) {
         const char *s = tok->vocab[i];
 
+        /* ------------------------------------------------------------------
+         * GPT-2 byte-level BPE: every vocab token is a sequence of GPT-2
+         * Unicode codepoints; decode each codepoint back to the original byte.
+         * Control tokens (special markers) are kept as-is.
+         * ------------------------------------------------------------------ */
+        if (tok->tok_model == CMOL_TOK_GPT2) {
+            int is_ctrl = tok->token_type &&
+                          tok->token_type[i] == CMOL_TOKEN_CONTROL;
+            if (!is_ctrl) {
+                /* Walk the UTF-8 string, decode each codepoint → byte. */
+                char dbuf[256];
+                int  dlen = 0;
+                const char *p = s;
+                while (*p && dlen < (int)sizeof(dbuf) - 1) {
+                    unsigned int cp = utf8_next_cp(&p);
+                    if (!cp) break;
+                    dbuf[dlen++] = (char)gpt2_cp_to_byte(cp);
+                }
+                dbuf[dlen] = '\0';
+                if (dlen > 0) {
+                    char *ds = (char *)cmol_arena_alloc(arena,
+                                                        (size_t)dlen + 1, 1);
+                    if (!ds) return CMOL_ERR_OOM;
+                    memcpy(ds, dbuf, (size_t)dlen + 1);
+                    tok->decoded_vocab[i] = ds;
+                    continue;
+                }
+            }
+            /* Control token or empty decode → alias raw string. */
+            tok->decoded_vocab[i] = s;
+            continue;
+        }
+
+        /* ------------------------------------------------------------------
+         * SentencePiece / Llama-style BPE
+         * ------------------------------------------------------------------ */
+
         /* Byte token?  Prefer the token_type flag; fall back to heuristic. */
         int is_byte = tok->token_type &&
                       (tok->token_type[i] == CMOL_TOKEN_BYTE);
@@ -216,19 +340,6 @@ cmol_err_t cmol_tokenizer_build(cmol_tokenizer_t *tok, cmol_arena_t *arena) {
     }
 
     return CMOL_OK;
-}
-
-/* =========================================================================
- * UTF-8 helpers
- * ====================================================================== */
-
-/* Returns the byte length of the UTF-8 sequence that starts with byte `c`. */
-static int utf8_seqlen(unsigned char c) {
-    if ((c & 0x80) == 0x00) return 1;
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1; /* invalid / continuation byte — treat as 1 */
 }
 
 /* =========================================================================
@@ -303,21 +414,104 @@ int cmol_tokenizer_encode(const cmol_tokenizer_t *tok,
     }                                                                   \
 } while (0)
 
-    const char *p = text;
+    if (tok->tok_model == CMOL_TOK_GPT2) {
+        /* ----------------------------------------------------------------
+         * GPT-2 byte-level pre-tokenisation:
+         * Iterate byte by byte, convert each to its GPT-2 Unicode char,
+         * encode as UTF-8, and look up as a single-codepoint vocab token.
+         *
+         * Control tokens (e.g. <|im_start|>) are matched verbatim first
+         * and emitted directly, bypassing the byte-level encoding.
+         * ---------------------------------------------------------------- */
+        const char *p = text;
+        while (*p && !overflowed) {
+            /* Greedy longest control-token match at current position. */
+            if (tok->token_type) {
+                int32_t best_id  = -1;
+                size_t  best_len = 0;
+                int     v;
+                for (v = 0; v < tok->vocab_size; v++) {
+                    if (tok->token_type[v] != CMOL_TOKEN_CONTROL) continue;
+                    const char *ts = tok->vocab[v];
+                    size_t tl = strlen(ts);
+                    if (tl > best_len && strncmp(p, ts, tl) == 0) {
+                        best_len = tl;
+                        best_id  = v;
+                    }
+                }
+                if (best_id >= 0) {
+                    if (w < BPE_WORK_MAX) work[w++] = best_id;
+                    else overflowed = 1;
+                    p += best_len;
+                    continue;
+                }
+            }
+            /* Normal byte: map to GPT-2 Unicode codepoint and look up. */
+            char vtok[5];
+            int vlen = cp_to_utf8(gpt2_byte_to_cp((unsigned char)*p++), vtok);
+            vtok[vlen] = '\0';
+            int32_t id = find_token_id(tok, vtok);
+            if (id < 0) id = tok->unk_id;
+            if (id >= 0) {
+                if (w < BPE_WORK_MAX) work[w++] = (int32_t)id;
+                else overflowed = 1;
+            }
+        }
+    } else {
+        /* ----------------------------------------------------------------
+         * SentencePiece / Llama-style pre-tokenisation:
+         * Inject ▁ dummy prefix; replace spaces with ▁; look up UTF-8 chars.
+         *
+         * Special token handling: before each character, check if any
+         * CMOL_TOKEN_CONTROL token matches verbatim at the current position.
+         * If so, emit it directly (bypassing BPE) — this handles ChatML
+         * delimiters like <|im_start|> and <|im_end|>.
+         * ---------------------------------------------------------------- */
+        const char *p = text;
 
-    /* Inject ▁ dummy prefix for SentencePiece models (non-empty text). */
-    if (tok->tok_model == CMOL_TOK_LLAMA && *p != '\0') {
-        EMIT_CHAR(SPIECE_PREFIX, 3);
-    }
+        /* Whether we have injected the ▁ prefix yet (only on first real char) */
+        int prefix_done = 0;
 
-    while (*p && !overflowed) {
-        if (*p == ' ') {
-            EMIT_CHAR(SPIECE_PREFIX, 3);
-            p++;
-        } else {
-            int len = utf8_seqlen((unsigned char)*p);
-            EMIT_CHAR(p, len);
-            p += len;
+        while (*p && !overflowed) {
+            /* Try control-token match (greedy longest) at current position. */
+            if (tok->token_type) {
+                int32_t best_id  = -1;
+                size_t  best_len = 0;
+                int     v;
+                for (v = 0; v < tok->vocab_size; v++) {
+                    if (tok->token_type[v] != CMOL_TOKEN_CONTROL) continue;
+                    const char *ts = tok->vocab[v];
+                    size_t tl = strlen(ts);
+                    if (tl > best_len && strncmp(p, ts, tl) == 0) {
+                        best_len = tl;
+                        best_id  = v;
+                    }
+                }
+                if (best_id >= 0) {
+                    /* Control token matched — emit directly, reset ▁ state */
+                    if (w < BPE_WORK_MAX) work[w++] = best_id;
+                    else overflowed = 1;
+                    p += best_len;
+                    prefix_done = 0; /* next real text needs a fresh ▁ prefix */
+                    continue;
+                }
+            }
+
+            /* Normal character: inject ▁ prefix on first character of segment */
+            if (!prefix_done && *p != '\0') {
+                EMIT_CHAR(SPIECE_PREFIX, 3);
+                prefix_done = 1;
+            }
+
+            if (*p == ' ') {
+                /* Space → ▁ (already handles segment boundary) */
+                EMIT_CHAR(SPIECE_PREFIX, 3);
+                p++;
+            } else {
+                int len = utf8_seqlen((unsigned char)*p);
+                EMIT_CHAR(p, len);
+                p += len;
+            }
         }
     }
 

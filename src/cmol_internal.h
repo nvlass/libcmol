@@ -29,6 +29,7 @@ typedef enum {
     CMOL_DTYPE_F16  = 1,
     CMOL_DTYPE_Q4_0 = 2,
     CMOL_DTYPE_Q4_1 = 3,
+    CMOL_DTYPE_Q5_0 = 6,  /* supported: 5-bit blocks of 32, 22 bytes    */
     CMOL_DTYPE_Q8_0 = 8,  /* supported: 8-bit blocks of 32              */
     CMOL_DTYPE_Q4_K = 12, /* supported: 4-bit blocks of 256 (Q4_K_M)   */
     CMOL_DTYPE_Q6_K = 14,
@@ -120,6 +121,7 @@ typedef struct {
     int32_t bos_id;
     int32_t eos_id;
     int32_t unk_id;
+    int     add_bos;   /* 1 = prepend BOS on encode (default), 0 = don't */
 
     /* ── built by cmol_tokenizer_build() (set by tokenizer.c) ──────── */
     const char       **decoded_vocab;   /* [vocab_size] ▁→space, <0xNN>→byte */

@@ -261,6 +261,56 @@ const char *cmol_version(void);
 size_t cmol_arena_estimate(const char *gguf_path, const cmol_config_t *cfg);
 
 /* =========================================================================
+ * ChatML prompt formatting helpers  (SmolLM2 / SmolLM3 style)
+ *
+ * These are pure string utilities — no model handle required.
+ * They are entirely optional; you can always hand-format prompts and pass
+ * them directly to cmol_generate().
+ *
+ * Both functions behave like snprintf:
+ *   - Write at most buf_cap bytes (including the NUL terminator).
+ *   - Return the number of bytes that would have been written had buf_cap
+ *     been unlimited (not counting the NUL).
+ *   - Return CMOL_ERR_TRUNC (negative) when buf_cap is too small; the
+ *     buffer is still NUL-terminated.
+ *   - Pass buf=NULL / buf_cap=0 to probe the required size.
+ * ====================================================================== */
+
+/*
+ * cmol_format_chatml — format the opening turn of a ChatML conversation.
+ *
+ *   system   — system message text.
+ *              NULL  → SmolLM default ("You are a helpful AI assistant …")
+ *              ""    → omit the system turn entirely
+ *              other → use verbatim as the system message
+ *   user     — user message text (required, must not be NULL)
+ *
+ * Output (with system):
+ *   <|im_start|>system\n{system}<|im_end|>\n
+ *   <|im_start|>user\n{user}<|im_end|>\n
+ *   <|im_start|>assistant\n
+ *
+ * Output (system == ""):
+ *   <|im_start|>user\n{user}<|im_end|>\n
+ *   <|im_start|>assistant\n
+ */
+int cmol_format_chatml(const char *system, const char *user,
+                        char *buf, size_t buf_cap);
+
+/*
+ * cmol_format_chatml_turn — format a subsequent user turn in an ongoing
+ * session.
+ *
+ * Our generation loop stops before writing the EOS token (<|im_end|>) into
+ * the KV cache, so each continuation must first close the previous assistant
+ * turn and then open a new user turn.
+ *
+ * Output:
+ *   <|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n
+ */
+int cmol_format_chatml_turn(const char *user, char *buf, size_t buf_cap);
+
+/* =========================================================================
  * Single-header implementation
  * ====================================================================== */
 

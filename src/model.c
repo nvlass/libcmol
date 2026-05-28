@@ -69,6 +69,7 @@ static size_t cmol__row_bytes(int k, cmol_dtype_t dtype) {
     switch (dtype) {
     case CMOL_DTYPE_F32:  return (size_t)k * 4u;
     case CMOL_DTYPE_F16:  return (size_t)k * 2u;
+    case CMOL_DTYPE_Q5_0: return (size_t)(k / 32)  * 22u;
     case CMOL_DTYPE_Q8_0: return (size_t)(k / 32)  * 34u;
     case CMOL_DTYPE_Q4_K: return (size_t)(k / 256) * 144u;
     case CMOL_DTYPE_Q6_K: return (size_t)(k / 256) * 210u;

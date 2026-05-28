@@ -47,11 +47,11 @@ platform.c → arena.c → gguf.c → tokenizer.c → quant.c
 | 5  | ✅ Done    | `model.c` + `attn.c` (RMSNorm, RoPE, GQA, SwiGLU, KV cache, NoPE, QK-norm) |
 | 6  | ✅ Done    | `sampler.c` (xoshiro256\*\*, greedy, temperature, top-k, top-p) |
 | 7  | ✅ Done    | `api.c`: `cmol_load()`, `cmol_free()`, `cmol_generate()` |
-| 8  | 🔶 Partial | `tests/test_generate.c` (22 unit tests + live tests); `tests/test_threads.c` pending |
-| 9  | ⬜ Pending | `examples/` (`repl.c`, `oneshot.c`) compilation verification |
-| 10 | ⬜ Pending | `tools/amalgamate.py` → `cmol_amalgam.h` |
+| 8  | ✅ Done    | `tests/test_generate.c` (41 unit tests + live tests); `tests/test_threads.c` (7 tests) |
+| 9  | ✅ Done    | `examples/` (`repl.c`, `oneshot.c`) compile and run correctly |
+| 10 | ✅ Done    | `tools/amalgamate.py` → `cmol_amalgam.h` single-header release |
 
-**Test counts:** `test_gguf`=47, `test_tokenizer`=39, `test_quant`=38, `test_model`=27, `test_sampler`=36, `test_generate`=22 (unit) + live → **209+ total**
+**Test counts:** `test_gguf`=47, `test_tokenizer`=39, `test_quant`=38, `test_model`=27, `test_sampler`=36, `test_generate`=41, `test_threads`=7 → **235 total**
 
 Run all: `make test`
 
@@ -123,7 +123,7 @@ Q6\_K value reconstruction: `lo | (hi << 4) - 32`, range `[-32, 31]`.
 - `seed=0` → non-deterministic: `time(NULL) ^ ++counter * constant ^ (uintptr_t)state`
 - `!rng_state` → deterministic top-1 fallback (no sampling)
 
-## Phase 7 — Completed
+## Phases 7–10 — Completed
 
 `cmol_load()` layout:
 1. `cmol_gguf_peek()` → hparams + n_tensors count
