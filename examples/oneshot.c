@@ -20,8 +20,8 @@
 #include "args.h"
 
 static int on_token(const char *piece, size_t len, int is_eos, void *_) {
-    (void)_; (void)is_eos;
-    fwrite(piece, 1, len, stdout);
+    (void)_;
+    if (!is_eos) fwrite(piece, 1, len, stdout);
     fflush(stdout);
     return 0;
 }
