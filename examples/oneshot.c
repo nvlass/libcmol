@@ -12,6 +12,7 @@
  *        --rep-pen      <float>  repetition penalty (default 1.1)
  *        --rep-n        <int>    repetition window size
  *   -n / --max-tokens   <int>    max tokens to generate (-1 = until EOS)
+ *        --system       <str>    system prompt ("" = omit, default: omit)
  */
 
 #include <stdio.h>
@@ -31,6 +32,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <model.gguf> <prompt> [options]\noptions:\n",
                 argv[0]);
         print_gen_args_usage();
+        fprintf(stderr, "       --system  <str>   system prompt (default: omit)\n");
         return 0;
     }
     if (argc < 3) {
@@ -40,8 +42,9 @@ int main(int argc, char **argv) {
 
     cmol_config_t     cfg    = CMOL_DEFAULT_CONFIG;
     cmol_gen_params_t params = CMOL_DEFAULT_PARAMS;
+    const char       *system = NULL;  /* NULL = omit system turn */
 
-    if (parse_gen_args(argc, argv, 3, &params, NULL))
+    if (parse_gen_args(argc, argv, 3, &params, &system))
         return 1;
 
     cmol_err_t    err;
@@ -49,7 +52,7 @@ int main(int argc, char **argv) {
     if (!m) { fprintf(stderr, "%s\n", cmol_strerror(err)); return 1; }
 
     char prompt[4096];
-    cmol_format_chatml(NULL, argv[2], prompt, sizeof prompt);
+    cmol_format_chatml(system, argv[2], prompt, sizeof prompt);
 
     cmol_session_t *s = cmol_session_acquire(m);
     cmol_err_t r = cmol_generate(s, prompt, &params, on_token, NULL);

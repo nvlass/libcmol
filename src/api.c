@@ -353,18 +353,15 @@ const char *cmol_decode_token(cmol_model_t *m, int32_t token_id) {
  * ChatML prompt formatting helpers
  * ====================================================================== */
 
-#define CMOL__DEFAULT_SYSTEM \
-    "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
-
 int cmol_format_chatml(const char *system, const char *user,
                         char *buf, size_t buf_cap) {
     int n;
     if (!user) return (int)CMOL_ERR_ARGS;
 
-    /* NULL  → SmolLM default system prompt
+    /* NULL  → omit system turn (same as "")
      * ""    → omit system turn
      * other → use verbatim                  */
-    const char *sys = (system == NULL) ? CMOL__DEFAULT_SYSTEM : system;
+    const char *sys = (system != NULL) ? system : "";
 
     if (sys[0] != '\0') {
         n = snprintf(buf, buf_cap,

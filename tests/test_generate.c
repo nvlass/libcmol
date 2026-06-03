@@ -127,12 +127,11 @@ static void test_chatml_format(void) {
     char buf[512];
     int  n;
 
-    printf("\n[cmol_format_chatml — default system message]\n");
+    printf("\n[cmol_format_chatml — NULL system (omit block)]\n");
     n = cmol_format_chatml(NULL, "Hi", buf, sizeof buf);
     CHECK(n > 0, "returns positive length");
-    CHECK(strstr(buf, "<|im_start|>system\n") != NULL,
-          "contains system block");
-    CHECK(strstr(buf, "SmolLM") != NULL, "contains 'SmolLM' default");
+    CHECK(strstr(buf, "system") == NULL,
+          "NULL omits system block (same as empty string)");
     CHECK(strstr(buf, "<|im_start|>user\nHi<|im_end|>") != NULL,
           "contains user message");
     CHECK(strstr(buf, "<|im_start|>assistant\n") != NULL,

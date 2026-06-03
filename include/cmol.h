@@ -285,7 +285,7 @@ size_t cmol_arena_estimate(const char *gguf_path, const cmol_config_t *cfg);
  * cmol_format_chatml — format the opening turn of a ChatML conversation.
  *
  *   system   — system message text.
- *              NULL  → SmolLM default ("You are a helpful AI assistant …")
+ *              NULL  → omit the system turn entirely (same as "")
  *              ""    → omit the system turn entirely
  *              other → use verbatim as the system message
  *   user     — user message text (required, must not be NULL)

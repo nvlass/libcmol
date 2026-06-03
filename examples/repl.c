@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
 
     cmol_config_t     cfg    = CMOL_DEFAULT_CONFIG;
     cmol_gen_params_t params = CMOL_DEFAULT_PARAMS;
-    const char       *system = NULL;  /* NULL = SmolLM default */
+    const char       *system = NULL;  /* NULL = omit system turn */
 
     if (parse_gen_args(argc, argv, 2, &params, &system))
         return 1;
@@ -65,9 +65,9 @@ int main(int argc, char **argv) {
         line[strcspn(line, "\n")] = '\0';
         if (!*line) break;
 
-        /* First turn: full ChatML with system message.
-           Later turns: append user+assistant headers only
-           (KV cache already holds the prior conversation). */
+        /* First turn: full ChatML (system turn included if --system was given).
+           Later turns: append user+assistant headers only;
+           KV cache holds the prior conversation. */
         if (turn == 0)
             cmol_format_chatml(system, line, prompt, sizeof prompt);
         else
