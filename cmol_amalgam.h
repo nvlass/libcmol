@@ -127,11 +127,16 @@ typedef struct {
     int          top_k;          /* 0 = disabled                          */
     int          max_new_tokens; /* -1 = generate until EOS               */
     unsigned int seed;           /* 0 = non-deterministic                 */
+    float        repeat_penalty; /* > 1.0 penalises recently-seen tokens; */
+                                 /* 1.0 = disabled                        */
+    int          repeat_last_n;  /* window of recent tokens to penalise;  */
+                                 /* clamped to CMOL_REPEAT_BUF (128)      */
 } cmol_gen_params_t;
 
 #define CMOL_DEFAULT_PARAMS \
     { .temperature = 0.8f, .top_p = 0.95f, .top_k = 40, \
-      .max_new_tokens = 256, .seed = 0 }
+      .max_new_tokens = 256, .seed = 0, \
+      .repeat_penalty = 1.1f, .repeat_last_n = 64 }
 
 /* =========================================================================
  * Opaque handle types
@@ -275,6 +280,56 @@ const char *cmol_version(void);
 size_t cmol_arena_estimate(const char *gguf_path, const cmol_config_t *cfg);
 
 /* =========================================================================
+ * ChatML prompt formatting helpers  (SmolLM2 / SmolLM3 style)
+ *
+ * These are pure string utilities — no model handle required.
+ * They are entirely optional; you can always hand-format prompts and pass
+ * them directly to cmol_generate().
+ *
+ * Both functions behave like snprintf:
+ *   - Write at most buf_cap bytes (including the NUL terminator).
+ *   - Return the number of bytes that would have been written had buf_cap
+ *     been unlimited (not counting the NUL).
+ *   - Return CMOL_ERR_TRUNC (negative) when buf_cap is too small; the
+ *     buffer is still NUL-terminated.
+ *   - Pass buf=NULL / buf_cap=0 to probe the required size.
+ * ====================================================================== */
+
+/*
+ * cmol_format_chatml — format the opening turn of a ChatML conversation.
+ *
+ *   system   — system message text.
+ *              NULL  → omit the system turn entirely (same as "")
+ *              ""    → omit the system turn entirely
+ *              other → use verbatim as the system message
+ *   user     — user message text (required, must not be NULL)
+ *
+ * Output (with system):
+ *   <|im_start|>system\n{system}<|im_end|>\n
+ *   <|im_start|>user\n{user}<|im_end|>\n
+ *   <|im_start|>assistant\n
+ *
+ * Output (system == ""):
+ *   <|im_start|>user\n{user}<|im_end|>\n
+ *   <|im_start|>assistant\n
+ */
+int cmol_format_chatml(const char *system, const char *user,
+                        char *buf, size_t buf_cap);
+
+/*
+ * cmol_format_chatml_turn — format a subsequent user turn in an ongoing
+ * session.
+ *
+ * Our generation loop stops before writing the EOS token (<|im_end|>) into
+ * the KV cache, so each continuation must first close the previous assistant
+ * turn and then open a new user turn.
+ *
+ * Output:
+ *   <|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n
+ */
+int cmol_format_chatml_turn(const char *user, char *buf, size_t buf_cap);
+
+/* =========================================================================
  * Single-header implementation
  * ====================================================================== */
 
@@ -374,6 +429,7 @@ typedef enum {
     CMOL_DTYPE_F16  = 1,
     CMOL_DTYPE_Q4_0 = 2,
     CMOL_DTYPE_Q4_1 = 3,
+    CMOL_DTYPE_Q5_0 = 6,  /* supported: 5-bit blocks of 32, 22 bytes    */
     CMOL_DTYPE_Q8_0 = 8,  /* supported: 8-bit blocks of 32              */
     CMOL_DTYPE_Q4_K = 12, /* supported: 4-bit blocks of 256 (Q4_K_M)   */
     CMOL_DTYPE_Q6_K = 14,
@@ -465,6 +521,7 @@ typedef struct {
     int32_t bos_id;
     int32_t eos_id;
     int32_t unk_id;
+    int     add_bos;   /* 1 = prepend BOS on encode (default), 0 = don't */
 
     /* ── built by cmol_tokenizer_build() (set by tokenizer.c) ──────── */
     const char       **decoded_vocab;   /* [vocab_size] ▁→space, <0xNN>→byte */
@@ -877,6 +934,25 @@ void cmol_rng_seed(uint64_t state[4], unsigned int seed);
 /* cmol_rng_next — return the next 64-bit value and advance the state. */
 uint64_t cmol_rng_next(uint64_t state[4]);
 
+/*
+ * cmol_apply_repeat_penalty — discount logits of recently-seen tokens.
+ *
+ * Applies the standard llama.cpp repetition penalty formula in-place,
+ * before temperature scaling and softmax:
+ *   logit > 0  →  logit /= penalty
+ *   logit ≤ 0  →  logit *= penalty
+ *
+ * `tokens`   — ring buffer of the last N generated/prompt tokens (IDs).
+ *              Any entry with id < 0 or id >= vocab_size is skipped.
+ * `n_tokens` — number of valid entries in `tokens` (≤ CMOL_REPEAT_BUF).
+ * `penalty`  — multiplier; values ≤ 1.0f are a no-op.
+ */
+#define CMOL_REPEAT_BUF 128
+
+void cmol_apply_repeat_penalty(float *logits, int vocab_size,
+                                const int32_t *tokens, int n_tokens,
+                                float penalty);
+
 /* ===== src/platform.c ===== */
 /*
  * platform.c — OS abstraction implementation
@@ -906,6 +982,17 @@ void cmol_mmap_close(cmol_mmap_t *m) {
 
 #else
 /* ---- POSIX --------------------------------------------------------------- */
+
+/* MADV_SEQUENTIAL is a Linux/BSD extension not visible under strict C99.
+ * _DEFAULT_SOURCE (glibc >= 2.19) or _BSD_SOURCE re-exposes it without
+ * pulling in the full GNU namespace.  Define before any system header. */
+#ifndef _DEFAULT_SOURCE
+#  define _DEFAULT_SOURCE
+#endif
+#ifndef _BSD_SOURCE          /* older glibc (< 2.19, e.g. Raspbian Wheezy) */
+#  define _BSD_SOURCE
+#endif
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -924,8 +1011,12 @@ cmol_err_t cmol_mmap_open(const char *path, cmol_mmap_t *out) {
     close(fd); /* fd can be closed immediately; mapping keeps the data alive */
     if (data == MAP_FAILED) return CMOL_ERR_IO;
 
-    /* Hint to the OS: we'll read sequentially during the parse pass */
+    /* Hint to the OS: we'll read sequentially during the parse pass.
+     * Guarded: MADV_SEQUENTIAL may be absent on non-Linux POSIX targets
+     * even with _DEFAULT_SOURCE (e.g. older musl, OpenBSD). */
+#ifdef MADV_SEQUENTIAL
     madvise(data, (size_t)st.st_size, MADV_SEQUENTIAL);
+#endif
 
     out->data = data;
     out->size = (size_t)st.st_size;
@@ -1141,6 +1232,7 @@ static const uint8_t GV_WIDTH[] = {1,1,2,2,4,4,4,1,0,0,8,8,8};
 #define K_TOK_BOS     "tokenizer.ggml.bos_token_id"
 #define K_TOK_EOS     "tokenizer.ggml.eos_token_id"
 #define K_TOK_UNK     "tokenizer.ggml.unknown_token_id"
+#define K_TOK_ADD_BOS "tokenizer.ggml.add_bos_token"
 
 /* =========================================================================
  * Dynamic key matching
@@ -1196,6 +1288,7 @@ static T gcur_##suffix(gcur_t *c) {                       \
 
 /* Instantiate only the readers used in gguf.c.
  * Phase 4 (quant.c) will add the remaining widths as needed. */
+GCUR_READ_FN(uint8_t,  u8)
 GCUR_READ_FN(uint32_t, u32)
 GCUR_READ_FN(int32_t,  i32)
 GCUR_READ_FN(uint64_t, u64)
@@ -1398,6 +1491,14 @@ static cmol_err_t read_kv(gcur_t *c, cmol_arena_t *a, char *arch,
         return CMOL_OK;
     }
 
+    /* ---- Scalar bool (GV_BOOL = 1 byte) ------------------------------- */
+    if (vtype == GV_BOOL) {
+        uint8_t v = gcur_u8(c);
+        if (c->err) return CMOL_ERR_INVALID;
+        if (!strcmp(key, K_TOK_ADD_BOS)) tok->add_bos = v ? 1 : 0;
+        return CMOL_OK;
+    }
+
     /* ---- Architecture-prefixed scalar float32 ------------------------ */
     if (vtype == GV_FLOAT32) {
         float v = gcur_f32(c);
@@ -1457,6 +1558,7 @@ static size_t tensor_nbytes(cmol_dtype_t dtype, int64_t n_elems) {
     switch (dtype) {
         case CMOL_DTYPE_F32:  return (size_t)n_elems * 4;
         case CMOL_DTYPE_F16:  return (size_t)n_elems * 2;
+        case CMOL_DTYPE_Q5_0: return (size_t)(n_elems / 32)  * 22;
         case CMOL_DTYPE_Q8_0: return (size_t)(n_elems / 32)  * 34;
         case CMOL_DTYPE_Q4_K: return (size_t)(n_elems / 256) * 144;
         case CMOL_DTYPE_Q6_K: return (size_t)(n_elems / 256) * 210;
@@ -1523,6 +1625,7 @@ cmol_err_t cmol_gguf_parse(const cmol_mmap_t *mmap,
     hp->rope_freq_base = 10000.0f;
     hp->rms_norm_eps   = 1e-5f;
     tok->bos_id = tok->eos_id = tok->unk_id = -1;
+    tok->add_bos = 1;  /* conservative default; overridden by tokenizer.ggml.add_bos_token */
 
     /* Architecture prefix — default "llama", overwritten by general.architecture */
     char arch[32] = "llama";
@@ -1775,6 +1878,93 @@ static int32_t find_merge_rank(const cmol_tokenizer_t *tok,
 }
 
 /* =========================================================================
+ * UTF-8 helpers
+ * ====================================================================== */
+
+/* Returns the byte length of the UTF-8 sequence that starts with byte `c`. */
+static int utf8_seqlen(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1; /* invalid / continuation byte — treat as 1 */
+}
+
+/* Parse one UTF-8 codepoint from *p, advancing *p past it. */
+static unsigned int utf8_next_cp(const char **p) {
+    const unsigned char *u = (const unsigned char *)*p;
+    unsigned int cp; int seqlen, i;
+    if (!u || !*u) return 0;
+    if      (u[0] < 0x80u) { cp = u[0]; seqlen = 1; }
+    else if (u[0] < 0xC0u) { (*p)++; return 0xFFFDu; } /* bare continuation */
+    else if (u[0] < 0xE0u) { cp = u[0] & 0x1Fu; seqlen = 2; }
+    else if (u[0] < 0xF0u) { cp = u[0] & 0x0Fu; seqlen = 3; }
+    else                   { cp = u[0] & 0x07u; seqlen = 4; }
+    for (i = 1; i < seqlen; i++) {
+        if ((u[i] & 0xC0u) != 0x80u) break; /* truncated */
+        cp = (cp << 6) | (u[i] & 0x3Fu);
+    }
+    *p += seqlen;
+    return cp;
+}
+
+/* Encode Unicode codepoint cp as UTF-8 into buf[]; return byte length (1-4). */
+static int cp_to_utf8(unsigned int cp, char buf[4]) {
+    if (cp < 0x80u) {
+        buf[0] = (char)cp; return 1;
+    } else if (cp < 0x800u) {
+        buf[0] = (char)(0xC0u | (cp >> 6));
+        buf[1] = (char)(0x80u | (cp & 0x3Fu)); return 2;
+    } else if (cp < 0x10000u) {
+        buf[0] = (char)(0xE0u | (cp >> 12));
+        buf[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        buf[2] = (char)(0x80u | (cp & 0x3Fu)); return 3;
+    } else {
+        buf[0] = (char)(0xF0u | (cp >> 18));
+        buf[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        buf[2] = (char)(0x80u | ((cp >> 6)  & 0x3Fu));
+        buf[3] = (char)(0x80u | (cp & 0x3Fu)); return 4;
+    }
+}
+
+/* =========================================================================
+ * GPT-2 byte-to-unicode mapping
+ *
+ * GPT-2 represents each byte 0x00-0xFF as a single Unicode codepoint so
+ * that every byte sequence has a lossless text representation:
+ *
+ *   "Kept" bytes (map to themselves):
+ *     0x21-0x7E  (printable ASCII: '!' to '~')
+ *     0xA1-0xAC  (¡ to ¬)
+ *     0xAE-0xFF  (® to ÿ)
+ *
+ *   "Extra" bytes (68 values, mapped to U+0100..U+0143 in byte-value order):
+ *     0x00-0x20  → U+0100-U+0120  (U+0120 = Ġ = space 0x20)
+ *     0x7F       → U+0121
+ *     0x80-0xA0  → U+0122-U+0142
+ *     0xAD       → U+0143
+ * ====================================================================== */
+
+/* Input byte → GPT-2 Unicode codepoint. */
+static unsigned int gpt2_byte_to_cp(unsigned char b) {
+    if (b <= 0x20u)              return 0x0100u + b;          /* 0x00-0x20 */
+    if (b <= 0x7Eu)              return b;                    /* 0x21-0x7E */
+    if (b == 0x7Fu)              return 0x0121u;
+    if (b <= 0xA0u)              return 0x0122u + (b - 0x80u); /* 0x80-0xA0 */
+    if (b == 0xADu)              return 0x0143u;
+    return b;                                                  /* kept */
+}
+
+/* GPT-2 Unicode codepoint → original byte (inverse of gpt2_byte_to_cp). */
+static unsigned char gpt2_cp_to_byte(unsigned int cp) {
+    if (cp >= 0x0100u && cp <= 0x0120u) return (unsigned char)(cp - 0x0100u);
+    if (cp == 0x0121u)                  return 0x7Fu;
+    if (cp >= 0x0122u && cp <= 0x0142u) return (unsigned char)(0x80u + (cp - 0x0122u));
+    if (cp == 0x0143u)                  return 0xADu;
+    return (unsigned char)(cp & 0xFFu); /* kept bytes pass through */
+}
+
+/* =========================================================================
  * cmol_tokenizer_build
  * ====================================================================== */
 
@@ -1855,6 +2045,43 @@ cmol_err_t cmol_tokenizer_build(cmol_tokenizer_t *tok, cmol_arena_t *arena) {
     for (int i = 0; i < V; i++) {
         const char *s = tok->vocab[i];
 
+        /* ------------------------------------------------------------------
+         * GPT-2 byte-level BPE: every vocab token is a sequence of GPT-2
+         * Unicode codepoints; decode each codepoint back to the original byte.
+         * Control tokens (special markers) are kept as-is.
+         * ------------------------------------------------------------------ */
+        if (tok->tok_model == CMOL_TOK_GPT2) {
+            int is_ctrl = tok->token_type &&
+                          tok->token_type[i] == CMOL_TOKEN_CONTROL;
+            if (!is_ctrl) {
+                /* Walk the UTF-8 string, decode each codepoint → byte. */
+                char dbuf[256];
+                int  dlen = 0;
+                const char *p = s;
+                while (*p && dlen < (int)sizeof(dbuf) - 1) {
+                    unsigned int cp = utf8_next_cp(&p);
+                    if (!cp) break;
+                    dbuf[dlen++] = (char)gpt2_cp_to_byte(cp);
+                }
+                dbuf[dlen] = '\0';
+                if (dlen > 0) {
+                    char *ds = (char *)cmol_arena_alloc(arena,
+                                                        (size_t)dlen + 1, 1);
+                    if (!ds) return CMOL_ERR_OOM;
+                    memcpy(ds, dbuf, (size_t)dlen + 1);
+                    tok->decoded_vocab[i] = ds;
+                    continue;
+                }
+            }
+            /* Control token or empty decode → alias raw string. */
+            tok->decoded_vocab[i] = s;
+            continue;
+        }
+
+        /* ------------------------------------------------------------------
+         * SentencePiece / Llama-style BPE
+         * ------------------------------------------------------------------ */
+
         /* Byte token?  Prefer the token_type flag; fall back to heuristic. */
         int is_byte = tok->token_type &&
                       (tok->token_type[i] == CMOL_TOKEN_BYTE);
@@ -1895,19 +2122,6 @@ cmol_err_t cmol_tokenizer_build(cmol_tokenizer_t *tok, cmol_arena_t *arena) {
     }
 
     return CMOL_OK;
-}
-
-/* =========================================================================
- * UTF-8 helpers
- * ====================================================================== */
-
-/* Returns the byte length of the UTF-8 sequence that starts with byte `c`. */
-static int utf8_seqlen(unsigned char c) {
-    if ((c & 0x80) == 0x00) return 1;
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1; /* invalid / continuation byte — treat as 1 */
 }
 
 /* =========================================================================
@@ -1982,21 +2196,104 @@ int cmol_tokenizer_encode(const cmol_tokenizer_t *tok,
     }                                                                   \
 } while (0)
 
-    const char *p = text;
+    if (tok->tok_model == CMOL_TOK_GPT2) {
+        /* ----------------------------------------------------------------
+         * GPT-2 byte-level pre-tokenisation:
+         * Iterate byte by byte, convert each to its GPT-2 Unicode char,
+         * encode as UTF-8, and look up as a single-codepoint vocab token.
+         *
+         * Control tokens (e.g. <|im_start|>) are matched verbatim first
+         * and emitted directly, bypassing the byte-level encoding.
+         * ---------------------------------------------------------------- */
+        const char *p = text;
+        while (*p && !overflowed) {
+            /* Greedy longest control-token match at current position. */
+            if (tok->token_type) {
+                int32_t best_id  = -1;
+                size_t  best_len = 0;
+                int     v;
+                for (v = 0; v < tok->vocab_size; v++) {
+                    if (tok->token_type[v] != CMOL_TOKEN_CONTROL) continue;
+                    const char *ts = tok->vocab[v];
+                    size_t tl = strlen(ts);
+                    if (tl > best_len && strncmp(p, ts, tl) == 0) {
+                        best_len = tl;
+                        best_id  = v;
+                    }
+                }
+                if (best_id >= 0) {
+                    if (w < BPE_WORK_MAX) work[w++] = best_id;
+                    else overflowed = 1;
+                    p += best_len;
+                    continue;
+                }
+            }
+            /* Normal byte: map to GPT-2 Unicode codepoint and look up. */
+            char vtok[5];
+            int vlen = cp_to_utf8(gpt2_byte_to_cp((unsigned char)*p++), vtok);
+            vtok[vlen] = '\0';
+            int32_t id = find_token_id(tok, vtok);
+            if (id < 0) id = tok->unk_id;
+            if (id >= 0) {
+                if (w < BPE_WORK_MAX) work[w++] = (int32_t)id;
+                else overflowed = 1;
+            }
+        }
+    } else {
+        /* ----------------------------------------------------------------
+         * SentencePiece / Llama-style pre-tokenisation:
+         * Inject ▁ dummy prefix; replace spaces with ▁; look up UTF-8 chars.
+         *
+         * Special token handling: before each character, check if any
+         * CMOL_TOKEN_CONTROL token matches verbatim at the current position.
+         * If so, emit it directly (bypassing BPE) — this handles ChatML
+         * delimiters like <|im_start|> and <|im_end|>.
+         * ---------------------------------------------------------------- */
+        const char *p = text;
 
-    /* Inject ▁ dummy prefix for SentencePiece models (non-empty text). */
-    if (tok->tok_model == CMOL_TOK_LLAMA && *p != '\0') {
-        EMIT_CHAR(SPIECE_PREFIX, 3);
-    }
+        /* Whether we have injected the ▁ prefix yet (only on first real char) */
+        int prefix_done = 0;
 
-    while (*p && !overflowed) {
-        if (*p == ' ') {
-            EMIT_CHAR(SPIECE_PREFIX, 3);
-            p++;
-        } else {
-            int len = utf8_seqlen((unsigned char)*p);
-            EMIT_CHAR(p, len);
-            p += len;
+        while (*p && !overflowed) {
+            /* Try control-token match (greedy longest) at current position. */
+            if (tok->token_type) {
+                int32_t best_id  = -1;
+                size_t  best_len = 0;
+                int     v;
+                for (v = 0; v < tok->vocab_size; v++) {
+                    if (tok->token_type[v] != CMOL_TOKEN_CONTROL) continue;
+                    const char *ts = tok->vocab[v];
+                    size_t tl = strlen(ts);
+                    if (tl > best_len && strncmp(p, ts, tl) == 0) {
+                        best_len = tl;
+                        best_id  = v;
+                    }
+                }
+                if (best_id >= 0) {
+                    /* Control token matched — emit directly, reset ▁ state */
+                    if (w < BPE_WORK_MAX) work[w++] = best_id;
+                    else overflowed = 1;
+                    p += best_len;
+                    prefix_done = 0; /* next real text needs a fresh ▁ prefix */
+                    continue;
+                }
+            }
+
+            /* Normal character: inject ▁ prefix on first character of segment */
+            if (!prefix_done && *p != '\0') {
+                EMIT_CHAR(SPIECE_PREFIX, 3);
+                prefix_done = 1;
+            }
+
+            if (*p == ' ') {
+                /* Space → ▁ (already handles segment boundary) */
+                EMIT_CHAR(SPIECE_PREFIX, 3);
+                p++;
+            } else {
+                int len = utf8_seqlen((unsigned char)*p);
+                EMIT_CHAR(p, len);
+                p += len;
+            }
         }
     }
 
@@ -2131,6 +2428,13 @@ static inline float f16_to_f32(uint16_t h) {
 #  define CMOL_PACKED  /* MSVC: use #pragma pack(push,1) around structs */
 #endif
 
+/* Q5_0 — 22 bytes */
+typedef struct CMOL_PACKED {
+    uint16_t d;       /* float16 scale                  */
+    uint8_t  qh[4];   /* 5th bit of each of 32 values   */
+    int8_t   qs[16];  /* lower 4 bits, 2 values/byte    */
+} q5_0_block_t;
+
 /* Q8_0 — 34 bytes */
 typedef struct CMOL_PACKED {
     uint16_t d;       /* float16 scale                  */
@@ -2154,6 +2458,7 @@ typedef struct CMOL_PACKED {
 } q6_k_block_t;
 
 /* Compile-time size checks */
+typedef char chk_q5_0[(sizeof(q5_0_block_t)  == 22)  ? 1 : -1];
 typedef char chk_q8_0[(sizeof(q8_0_block_t)  == 34)  ? 1 : -1];
 typedef char chk_q4_k[(sizeof(q4_k_block_t)  == 144) ? 1 : -1];
 typedef char chk_q6_k[(sizeof(q6_k_block_t)  == 210) ? 1 : -1];
@@ -2189,6 +2494,28 @@ static inline void q4k_get_scale_min(int j, const uint8_t *s,
  * in the SIMD kernel functions.
  * ====================================================================== */
 
+/*
+ * Q5_0 block layout:
+ *   qs[j]  holds the lower nibble  of value j       (j = 0..15, first  half)
+ *              and the upper nibble of value j + 16  (j = 0..15, second half).
+ *   qh bits 0-15  hold the 5th bit of values  0-15 (bit j → value j).
+ *   qh bits 16-31 hold the 5th bit of values 16-31 (bit j+16 → value j+16).
+ * Combined value [0..31] → subtract 16 → signed [-16..15].
+ */
+static void dequant_block_q5_0(const q5_0_block_t *b, float *dst) {
+    float    d = f16_to_f32(b->d);
+    uint32_t qh;
+    int      j;
+    memcpy(&qh, b->qh, 4);
+    for (j = 0; j < 16; j++) {
+        uint8_t xh0 = (uint8_t)(((qh >>  j)      & 1u) << 4);
+        uint8_t xh1 = (uint8_t)(((qh >> (j + 16)) & 1u) << 4);
+        uint8_t q   = (uint8_t)b->qs[j]; /* cast to unsigned before shifting */
+        dst[j]      = d * (float)((int)((q & 0x0Fu) | xh0) - 16);
+        dst[j + 16] = d * (float)((int)((q >>  4  ) | xh1) - 16);
+    }
+}
+
 static void dequant_block_q8_0(const q8_0_block_t *b, float *dst) {
     float d = f16_to_f32(b->d);
     int i;
@@ -2206,10 +2533,15 @@ static void dequant_block_q4_k(const q4_k_block_t *b, float *dst) {
         float db = d    * (float)sc;
         float mb = dmin * (float)mn;
 
-        const uint8_t *q = b->qs + sub * 16;
-        for (k = 0; k < 16; k++) {
-            dst[sub * 32 + k * 2 + 0] = db * (float)(q[k] & 0xF) - mb;
-            dst[sub * 32 + k * 2 + 1] = db * (float)(q[k] >> 4)  - mb;
+        /* Pairs of sub-blocks share the same 32-byte qs chunk:
+         *   sub 0,1 → qs[  0.. 31]   sub 2,3 → qs[ 32.. 63]
+         *   sub 4,5 → qs[ 64.. 95]   sub 6,7 → qs[ 96..127]
+         * Even sub → lower nibble (shift 0); odd sub → upper nibble (shift 4).
+         * Matches llama.cpp dequantize_row_q4_K (64-value inner loop). */
+        const uint8_t *q = b->qs + (sub / 2) * 32;
+        int shift = (sub & 1) ? 4 : 0;
+        for (k = 0; k < 32; k++) {
+            dst[sub * 32 + k] = db * (float)((q[k] >> shift) & 0xFu) - mb;
         }
     }
 }
@@ -2218,10 +2550,36 @@ static void dequant_block_q6_k(const q6_k_block_t *b, float *dst) {
     float d = f16_to_f32(b->d);
     int i;
 
+    /*
+     * Q6_K output ordering — derived from llama.cpp dequantize_row_q6_K.
+     * The 256 outputs are arranged in 8 groups of 32 (g8 = i/32, j32 = i%32):
+     *
+     * ql (128 bytes):
+     *   g8  0,1 → bytes   0-31,  32-63  lower nibble (& 0xF)
+     *   g8  2,3 → bytes   0-31,  32-63  upper nibble (>> 4)
+     *   g8  4,5 → bytes  64-95,  96-127 lower nibble
+     *   g8  6,7 → bytes  64-95,  96-127 upper nibble
+     *   Compact: ql_idx = (g8<4 ? 0 : 64) + (g8&1)*32 + j32
+     *            ql_shift = (g8&2) ? 4 : 0
+     *
+     * qh (64 bytes): 2-bit groups, two bit-pairs per byte
+     *   g8  0-3 → qh[ 0..31], bit-pair (g8%4)*2
+     *   g8  4-7 → qh[32..63], bit-pair (g8%4)*2
+     *   Compact: qh_idx = (g8<4 ? 0 : 32) + j32
+     *            qh_shift = (g8 & 3) * 2
+     *
+     * scales: 16 int8 scale values, one per 16 outputs → scales[i/16]
+     */
     for (i = 0; i < 256; i++) {
-        uint8_t lo = (b->ql[i / 2] >> ((i & 1) * 4)) & 0xFu;
-        uint8_t hi = (b->qh[i / 4] >> ((i & 3) * 2)) & 0x3u;
-        int8_t  q  = (int8_t)((int)(lo | ((unsigned)hi << 4)) - 32);
+        int     g8     = i / 32;
+        int     j32    = i % 32;
+        int     ql_idx = (g8 < 4 ? 0 : 64) + (g8 & 1) * 32 + j32;
+        int     ql_sh  = (g8 & 2) ? 4 : 0;
+        uint8_t lo     = (b->ql[ql_idx] >> ql_sh) & 0xFu;
+        int     qh_idx = (g8 < 4 ? 0 : 32) + j32;
+        int     qh_sh  = (g8 & 3) * 2;
+        uint8_t hi     = (b->qh[qh_idx] >> qh_sh) & 0x3u;
+        int     q      = (int)(lo | ((unsigned)hi << 4)) - 32;
         dst[i] = d * (float)b->scales[i / 16] * (float)q;
     }
 }
@@ -2247,6 +2605,13 @@ void cmol_dequant_row(const void *src, float *dst, int n, cmol_dtype_t dtype) {
         const uint16_t *s = (const uint16_t *)src;
         int i;
         for (i = 0; i < n; i++) dst[i] = f16_to_f32(s[i]);
+        break;
+    }
+
+    case CMOL_DTYPE_Q5_0: {
+        const q5_0_block_t *b = (const q5_0_block_t *)src;
+        int bi, nb = n / 32;
+        for (bi = 0; bi < nb; bi++) dequant_block_q5_0(&b[bi], dst + bi * 32);
         break;
     }
 
@@ -2287,6 +2652,7 @@ static inline int block_params(cmol_dtype_t dtype, size_t *bsz) {
     switch (dtype) {
     case CMOL_DTYPE_F32:  *bsz = sizeof(float);          return 1;
     case CMOL_DTYPE_F16:  *bsz = sizeof(uint16_t);       return 1;
+    case CMOL_DTYPE_Q5_0: *bsz = sizeof(q5_0_block_t);   return 32;
     case CMOL_DTYPE_Q8_0: *bsz = sizeof(q8_0_block_t);   return 32;
     case CMOL_DTYPE_Q4_K: *bsz = sizeof(q4_k_block_t);   return 256;
     case CMOL_DTYPE_Q6_K: *bsz = sizeof(q6_k_block_t);   return 256;
@@ -2298,6 +2664,7 @@ static inline int block_params(cmol_dtype_t dtype, size_t *bsz) {
  * Assumes `blk` is correctly aligned (it comes from the GGUF mmap). */
 static inline void dequant_block(const void *blk, float *tmp, cmol_dtype_t dtype) {
     switch (dtype) {
+    case CMOL_DTYPE_Q5_0: dequant_block_q5_0((const q5_0_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q8_0: dequant_block_q8_0((const q8_0_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q4_K: dequant_block_q4_k((const q4_k_block_t *)blk, tmp); break;
     case CMOL_DTYPE_Q6_K: dequant_block_q6_k((const q6_k_block_t *)blk, tmp); break;
@@ -2699,7 +3066,7 @@ cmol_kernels_t cmol_kernels_select(void) {
  *   cmol_rms_norm    — in-place RMSNorm
  *   cmol_softmax     — numerically stable softmax
  *   cmol_swiglu      — SiLU(gate) * up  (SwiGLU activation)
- *   cmol_rope_apply  — rotary position encoding (LLaMA half-rotation style)
+ *   cmol_rope_apply  — rotary position encoding (LLaMA NORM style: adjacent pairs)
  *   cmol_model_forward — full N-layer transformer pass for one token
  *
  * Tensor naming convention (matches llama.cpp GGUF output):
@@ -2760,6 +3127,7 @@ static size_t cmol__row_bytes(int k, cmol_dtype_t dtype) {
     switch (dtype) {
     case CMOL_DTYPE_F32:  return (size_t)k * 4u;
     case CMOL_DTYPE_F16:  return (size_t)k * 2u;
+    case CMOL_DTYPE_Q5_0: return (size_t)(k / 32)  * 22u;
     case CMOL_DTYPE_Q8_0: return (size_t)(k / 32)  * 34u;
     case CMOL_DTYPE_Q4_K: return (size_t)(k / 256) * 144u;
     case CMOL_DTYPE_Q6_K: return (size_t)(k / 256) * 210u;
@@ -2813,13 +3181,16 @@ void cmol_swiglu(const float *gate, const float *up, float *out, int n) {
 }
 
 /*
- * cmol_rope_apply — LLaMA half-rotation RoPE
+ * cmol_rope_apply — LLaMA NORM-style RoPE (GGML_ROPE_TYPE_NORM)
  *
- * For each head h and dimension i in [0, head_dim/2):
- *   θ_i = pos / freq_base^(2i / head_dim)
- *   q[h][i]           ← q[h][i] * cos(θ) − q[h][i+half] * sin(θ)
- *   q[h][i + half]    ← q[h][i] * sin(θ) + q[h][i+half] * cos(θ)
+ * Rotates adjacent dimension pairs within each head:
+ *   For each head h and pair index i in [0, head_dim/2):
+ *     θ_i = pos / freq_base^(2i / head_dim)
+ *     q[h][2i]   ← q[h][2i]   * cos(θ) − q[h][2i+1] * sin(θ)
+ *     q[h][2i+1] ← q[h][2i]   * sin(θ) + q[h][2i+1] * cos(θ)
  *   (same for k, up to n_kv_heads)
+ *
+ * Note: LLaMA uses NORM style (adjacent pairs), not NEOX style (split halves).
  */
 void cmol_rope_apply(float *q, float *k,
                      int pos, int n_heads, int n_kv_heads,
@@ -2833,9 +3204,9 @@ void cmol_rope_apply(float *q, float *k,
             float theta = (float)pos /
                           powf(freq_base, (float)(2 * i) / (float)head_dim);
             float cs = cosf(theta), sn = sinf(theta);
-            float q0 = qh[i], q1 = qh[i + half];
-            qh[i]        = q0 * cs - q1 * sn;
-            qh[i + half] = q0 * sn + q1 * cs;
+            float q0 = qh[2 * i], q1 = qh[2 * i + 1];
+            qh[2 * i]     = q0 * cs - q1 * sn;
+            qh[2 * i + 1] = q0 * sn + q1 * cs;
         }
     }
 
@@ -2845,9 +3216,9 @@ void cmol_rope_apply(float *q, float *k,
             float theta = (float)pos /
                           powf(freq_base, (float)(2 * i) / (float)head_dim);
             float cs = cosf(theta), sn = sinf(theta);
-            float k0 = kh[i], k1 = kh[i + half];
-            kh[i]        = k0 * cs - k1 * sn;
-            kh[i + half] = k0 * sn + k1 * cs;
+            float k0 = kh[2 * i], k1 = kh[2 * i + 1];
+            kh[2 * i]     = k0 * cs - k1 * sn;
+            kh[2 * i + 1] = k0 * sn + k1 * cs;
         }
     }
 }
@@ -3270,6 +3641,25 @@ static int topk_select(const float *probs, int V, int k,
         }
     }
     return n;
+}
+
+/* =========================================================================
+ * cmol_apply_repeat_penalty
+ * ====================================================================== */
+
+void cmol_apply_repeat_penalty(float *logits, int vocab_size,
+                                const int32_t *tokens, int n_tokens,
+                                float penalty) {
+    int i;
+    if (penalty <= 1.0f || !logits || !tokens || n_tokens <= 0) return;
+    for (i = 0; i < n_tokens; i++) {
+        int32_t id = tokens[i];
+        if (id < 0 || id >= vocab_size) continue;
+        if (logits[id] > 0.0f)
+            logits[id] /= penalty;
+        else
+            logits[id] *= penalty;
+    }
 }
 
 /* =========================================================================
@@ -3697,12 +4087,61 @@ void cmol_session_reset(cmol_session_t *s) {
 int cmol_encode(cmol_model_t *m, const char *text,
                 int32_t *out, int out_cap) {
     if (!m || !text || !out || out_cap <= 0) return CMOL_ERR_ARGS;
-    return cmol_tokenizer_encode(&m->tokenizer, text, out, out_cap, /*add_bos=*/1);
+    return cmol_tokenizer_encode(&m->tokenizer, text, out, out_cap,
+                                 m->tokenizer.add_bos);
 }
 
 const char *cmol_decode_token(cmol_model_t *m, int32_t token_id) {
     if (!m) return NULL;
     return cmol_tokenizer_decode_token(&m->tokenizer, token_id);
+}
+
+/* =========================================================================
+ * ChatML prompt formatting helpers
+ * ====================================================================== */
+
+int cmol_format_chatml(const char *system, const char *user,
+                        char *buf, size_t buf_cap) {
+    int n;
+    if (!user) return (int)CMOL_ERR_ARGS;
+
+    /* NULL  → omit system turn (same as "")
+     * ""    → omit system turn
+     * other → use verbatim                  */
+    const char *sys = (system != NULL) ? system : "";
+
+    if (sys[0] != '\0') {
+        n = snprintf(buf, buf_cap,
+            "<|im_start|>system\n%s<|im_end|>\n"
+            "<|im_start|>user\n%s<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            sys, user);
+    } else {
+        n = snprintf(buf, buf_cap,
+            "<|im_start|>user\n%s<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            user);
+    }
+
+    if (n < 0) return (int)CMOL_ERR_ARGS;
+    if (buf && buf_cap > 0 && (size_t)n >= buf_cap) return (int)CMOL_ERR_TRUNC;
+    return n;
+}
+
+int cmol_format_chatml_turn(const char *user, char *buf, size_t buf_cap) {
+    int n;
+    if (!user) return (int)CMOL_ERR_ARGS;
+
+    /* Close the previous (open) assistant turn, then open the new user turn. */
+    n = snprintf(buf, buf_cap,
+        "<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        user);
+
+    if (n < 0) return (int)CMOL_ERR_ARGS;
+    if (buf && buf_cap > 0 && (size_t)n >= buf_cap) return (int)CMOL_ERR_TRUNC;
+    return n;
 }
 
 /* =========================================================================
@@ -3738,7 +4177,7 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
     int n_prompt = cmol_tokenizer_encode(
             &m->tokenizer, prompt,
             s->token_buf, s->token_buf_cap,
-            /*add_bos=*/1);
+            m->tokenizer.add_bos);
     if (n_prompt < 0)  return (cmol_err_t)n_prompt;
     if (n_prompt == 0) return CMOL_OK;
 
@@ -3769,14 +4208,35 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
     uint64_t rng[4];
     cmol_rng_seed(rng, params->seed);
 
+    /* Repetition-penalty ring buffer — seed with tail of prompt tokens */
+    int32_t repeat_buf[CMOL_REPEAT_BUF];
+    int     repeat_head = 0;   /* next write position (wraps)  */
+    int     repeat_fill = 0;   /* entries currently valid       */
+    {
+        int last_n = params->repeat_last_n;
+        if (last_n <= 0 || last_n > CMOL_REPEAT_BUF) last_n = CMOL_REPEAT_BUF;
+        int seed_n = n_prompt < last_n ? n_prompt : last_n;
+        for (i = 0; i < seed_n; i++)
+            repeat_buf[i] = s->token_buf[n_prompt - seed_n + i];
+        repeat_head = seed_n % CMOL_REPEAT_BUF;
+        repeat_fill = seed_n;
+    }
+
     int n_generated = 0;
 
     for (;;) {
+        /* ── Repetition penalty (applied before temperature / softmax) ── */
+        if (params->repeat_penalty > 1.0f && repeat_fill > 0)
+            cmol_apply_repeat_penalty(logits, hp->vocab_size,
+                                      repeat_buf, repeat_fill,
+                                      params->repeat_penalty);
+
         /* ── Sample next token ─────────────────────────────────────────── */
         int32_t next_tok = cmol_sample(logits, hp->vocab_size, params, rng);
 
         /* ── Decode + fire callback ────────────────────────────────────── */
-        int is_eos = (next_tok == hp->eos_token_id);
+        int is_eos = (m->tokenizer.eos_id >= 0 &&
+                      next_tok == m->tokenizer.eos_id);
 
         if (on_token) {
             const char *piece = cmol_tokenizer_decode_token(&m->tokenizer,
@@ -3787,6 +4247,11 @@ cmol_err_t cmol_generate(cmol_session_t          *s,
         }
 
         if (is_eos) break;
+
+        /* ── Push generated token into repeat window ──────────────────── */
+        repeat_buf[repeat_head] = next_tok;
+        repeat_head = (repeat_head + 1) % CMOL_REPEAT_BUF;
+        if (repeat_fill < CMOL_REPEAT_BUF) repeat_fill++;
 
         n_generated++;
         if (max_new > 0 && n_generated >= max_new) break;

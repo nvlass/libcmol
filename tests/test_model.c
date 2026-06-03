@@ -142,25 +142,26 @@ static void test_rope(void) {
     CHECK(NEAR(q[1], q_ref[1]) && NEAR(q[5], q_ref[5]), "pos=0: Q head1 unchanged");
     CHECK(NEAR(k[0], k_ref[0]) && NEAR(k[2], k_ref[2]), "pos=0: K unchanged");
 
-    /* At pos=1, head_dim=4: theta_0 = 1/10000^0 = 1.0
-     * For i=0: cos(1)≈0.5403, sin(1)≈0.8415
-     * q'[0] = q[0]*cos - q[2]*sin = 1*0.5403 - 3*0.8415 ≈ -1.9843
-     * q'[2] = q[0]*sin + q[2]*cos = 1*0.8415 + 3*0.5403 ≈  2.4624
+    /* At pos=1, head_dim=4: NORM style rotates adjacent pairs.
+     * theta_0 = pos / freq_base^(2*0/4) = 1/1 = 1.0  → pair (q[0], q[1])
+     * theta_1 = pos / freq_base^(2*1/4) = 1/100 = 0.01 → pair (q[2], q[3])
+     * q'[0] = q[0]*cos(1) - q[1]*sin(1) = 1*0.5403 - 2*0.8415 ≈ -1.1427
+     * q'[1] = q[0]*sin(1) + q[1]*cos(1) = 1*0.8415 + 2*0.5403 ≈  1.9221
      */
     float q2[4] = {1.0f, 2.0f, 3.0f, 4.0f}; /* 1 head, head_dim=4 */
     float k2[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     float dummy[1] = {0}; (void)dummy;
     cmol_rope_apply(q2, k2, 1, 1, 1, 4, 10000.0f);
 
-    float theta0 = 1.0f; /* pos=1, dim=0: freq_base^0 = 1 */
-    float q0_expected = 1.0f * cosf(theta0) - 3.0f * sinf(theta0);
-    float q2_expected = 1.0f * sinf(theta0) + 3.0f * cosf(theta0);
+    float theta0 = 1.0f; /* pos=1, pair i=0: 1/10000^(0/4) = 1.0 */
+    float q0_expected = 1.0f * cosf(theta0) - 2.0f * sinf(theta0);
+    float q1_expected = 1.0f * sinf(theta0) + 2.0f * cosf(theta0);
     CHECK(NEAR3(q2[0], q0_expected), "pos=1 Q[0] rotated");
-    CHECK(NEAR3(q2[2], q2_expected), "pos=1 Q[2] rotated");
+    CHECK(NEAR3(q2[1], q1_expected), "pos=1 Q[2] rotated");
 
-    /* Rotation must be orthonormal: norm preserved */
-    float norm_before = sqrtf(1.0f*1.0f + 3.0f*3.0f);
-    float norm_after  = sqrtf(q2[0]*q2[0] + q2[2]*q2[2]);
+    /* Rotation must be orthonormal: norm of each pair preserved */
+    float norm_before = sqrtf(1.0f*1.0f + 2.0f*2.0f);
+    float norm_after  = sqrtf(q2[0]*q2[0] + q2[1]*q2[1]);
     CHECK(NEAR(norm_before, norm_after), "RoPE preserves norm");
 }
 

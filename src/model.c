@@ -6,7 +6,7 @@
  *   cmol_rms_norm    — in-place RMSNorm
  *   cmol_softmax     — numerically stable softmax
  *   cmol_swiglu      — SiLU(gate) * up  (SwiGLU activation)
- *   cmol_rope_apply  — rotary position encoding (LLaMA half-rotation style)
+ *   cmol_rope_apply  — rotary position encoding (LLaMA NORM style: adjacent pairs)
  *   cmol_model_forward — full N-layer transformer pass for one token
  *
  * Tensor naming convention (matches llama.cpp GGUF output):
@@ -123,13 +123,16 @@ void cmol_swiglu(const float *gate, const float *up, float *out, int n) {
 }
 
 /*
- * cmol_rope_apply — LLaMA half-rotation RoPE
+ * cmol_rope_apply — LLaMA NORM-style RoPE (GGML_ROPE_TYPE_NORM)
  *
- * For each head h and dimension i in [0, head_dim/2):
- *   θ_i = pos / freq_base^(2i / head_dim)
- *   q[h][i]           ← q[h][i] * cos(θ) − q[h][i+half] * sin(θ)
- *   q[h][i + half]    ← q[h][i] * sin(θ) + q[h][i+half] * cos(θ)
+ * Rotates adjacent dimension pairs within each head:
+ *   For each head h and pair index i in [0, head_dim/2):
+ *     θ_i = pos / freq_base^(2i / head_dim)
+ *     q[h][2i]   ← q[h][2i]   * cos(θ) − q[h][2i+1] * sin(θ)
+ *     q[h][2i+1] ← q[h][2i]   * sin(θ) + q[h][2i+1] * cos(θ)
  *   (same for k, up to n_kv_heads)
+ *
+ * Note: LLaMA uses NORM style (adjacent pairs), not NEOX style (split halves).
  */
 void cmol_rope_apply(float *q, float *k,
                      int pos, int n_heads, int n_kv_heads,
@@ -143,9 +146,9 @@ void cmol_rope_apply(float *q, float *k,
             float theta = (float)pos /
                           powf(freq_base, (float)(2 * i) / (float)head_dim);
             float cs = cosf(theta), sn = sinf(theta);
-            float q0 = qh[i], q1 = qh[i + half];
-            qh[i]        = q0 * cs - q1 * sn;
-            qh[i + half] = q0 * sn + q1 * cs;
+            float q0 = qh[2 * i], q1 = qh[2 * i + 1];
+            qh[2 * i]     = q0 * cs - q1 * sn;
+            qh[2 * i + 1] = q0 * sn + q1 * cs;
         }
     }
 
@@ -155,9 +158,9 @@ void cmol_rope_apply(float *q, float *k,
             float theta = (float)pos /
                           powf(freq_base, (float)(2 * i) / (float)head_dim);
             float cs = cosf(theta), sn = sinf(theta);
-            float k0 = kh[i], k1 = kh[i + half];
-            kh[i]        = k0 * cs - k1 * sn;
-            kh[i + half] = k0 * sn + k1 * cs;
+            float k0 = kh[2 * i], k1 = kh[2 * i + 1];
+            kh[2 * i]     = k0 * cs - k1 * sn;
+            kh[2 * i + 1] = k0 * sn + k1 * cs;
         }
     }
 }
