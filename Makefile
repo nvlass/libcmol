@@ -26,7 +26,7 @@ TESTS       = $(patsubst tests/%.c,$(BUILD_TESTS)/%,$(TEST_SRCS))
 EXAMPLE_SRCS = $(wildcard examples/*.c)
 EXAMPLES     = $(patsubst examples/%.c,$(BUILD_EX)/%,$(EXAMPLE_SRCS))
 
-.PHONY: all debug release test examples amalgamate compdb clean
+.PHONY: all debug release test model-tests examples amalgamate compdb clean
 
 all: debug
 
@@ -62,6 +62,31 @@ test: $(BUILD)/cmol_d.o | $(BUILD_TESTS)
 	done; \
 	echo ""; \
 	echo "  Results: $$passed passed, $$failed failed."
+
+# ── model-tests (reference logit comparison, requires CMOL_TEST_GGUF) ────
+# Usage:
+#   CMOL_TEST_GGUF=models/SmolLM2-360M-Instruct-Q4_K_M.gguf make model-tests
+#
+# Runs tools/gen_ref.py (requires: pip install gguf) to generate reference
+# logits via the Python gguf dequantizer, then compiles and runs
+# tests/test_model_ref which compares the C forward pass against that
+# reference at every position (last prefill + N generation steps).
+
+REF_BIN   ?= /tmp/cmol_ref.bin
+N_GEN     ?= 3
+
+model-tests: $(BUILD)/cmol_d.o | $(BUILD_TESTS)
+	@if [ -z "$(CMOL_TEST_GGUF)" ]; then \
+		echo "  SKIP  model-tests: set CMOL_TEST_GGUF=<path-to.gguf>"; \
+		exit 0; \
+	fi
+	@echo "  GEN   $(REF_BIN)  (Python reference, may take ~30s)"
+	python3 tools/gen_ref.py "$(CMOL_TEST_GGUF)" "$(REF_BIN)" --n-gen $(N_GEN)
+	$(CC) $(CFLAGS) $(DFLAGS) tests/test_model_ref.c $(BUILD)/cmol_d.o \
+	      -o $(BUILD_TESTS)/test_model_ref $(LDFLAGS)
+	@echo "  RUN   test_model_ref"
+	CMOL_TEST_GGUF="$(CMOL_TEST_GGUF)" CMOL_REF_BIN="$(REF_BIN)" \
+	  $(BUILD_TESTS)/test_model_ref
 
 # ── examples ──────────────────────────────────────────────────────────────
 examples: $(BUILD)/cmol.o | $(BUILD_EX)

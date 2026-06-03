@@ -5,5 +5,8 @@ models/
 *.gguf
 # cmol_amalgam.h is committed (regenerate with: make amalgamate)
 compile_commands.json
+# Emacs temp/lock files
+\#*\#
+.#*
 .DS_Store
 .cache/
